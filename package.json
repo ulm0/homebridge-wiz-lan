@@ -1,6 +1,6 @@
 {
   "name": "homebridge-wiz-lan",
-  "version": "3.3.4",
+  "version": "3.3.5",
   "description": "A homebridge plugin to control Wiz Lights",
   "main": "dist/index.js",
   "keywords": [
@@ -29,11 +29,11 @@
   },
   "devDependencies": {
     "@types/node": "^25.2.3",
-    "homebridge": "^2.0.0-beta.70",
+    "homebridge": "^2.0.1",
     "nodemon": "^3.1.11",
     "rimraf": "^6.1.2",
     "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+    "typescript": "^6.0.3"
   },
   "bugs": {
     "url": "https://github.com/kpsuperplane/homebridge-wiz-lan/issues"

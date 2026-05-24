@@ -2,8 +2,8 @@
 Based off of kpsuperplane/homebridge-iotas
 
 ## Currently supports
-- Lightbulbs (RGB, Color Temp, and Single Color) (tested with Wiz 100W Color & Wiz 30W Filaments)
-- Wiz Plugs/Outlets (ESP10_SOCKET_06, ESP25_SOCKET_01, ESP20_DHRGB_01)
+- Lightbulbs (RGB, Tunable White, Dimmer, Light Strips, LED String Lights, Light Poles)
+- Wiz Plugs/Outlets (ESP10_SOCKET_06, ESP25_SOCKET_01)
 
 # Installation
 
@@ -50,30 +50,40 @@ Full configuration options:
     // Default: Autodiscovered
     "address": "192.168.0.1",
 
-    // [Optional] Manual list of IP addresses of bulbs
-    // Useful if UDP broadcast doesn't work for some reason
+    // [Optional] Manual list of bulbs. `host` is required; `name` overrides
+    // the HomeKit display name, `mac` pins the entry to a specific device.
     // Default: None
     "devices": [
       { "host": "192.168.0.2" },
-      { "host": "192.168.0.3" },
-      { "host": "192.168.0.4" },
+      { "host": "192.168.0.3", "name": "Living Room Lamp" },
+      { "host": "192.168.0.4", "mac": "AA:BB:CC:DD:EE:FF", "name": "Desk Strip" },
       // ...
+    ],
+
+    // [Optional] Devices to exclude from HomeKit. Match by `host` or `mac`.
+    // Devices already in the Homebridge cache are unregistered on next start.
+    // Default: None
+    "ignoredDevices": [
+      { "mac": "AA:BB:CC:DD:EE:FF" },
+      { "host": "192.168.0.99" },
     ],
 
     // [Optional] Refresh/ping every accessory to get their latest state on an interval. Specify in seconds, 0 = off
     // Default: 0
     "refreshInterval": 60,
 
-    // [Optional] Surface unresponsive bulbs to HomeKit as "Not Responding"
-    // instead of silently replaying their last known state. Requires
-    // refreshInterval > 0 to detect offline bulbs in the background.
-    // Default: false
-    "reportOffline": false,
+    // [Optional] Re-broadcast the discovery message periodically to detect
+    // devices added after startup. Specify in seconds, 0 = off
+    // Default: 0
+    "discoveryInterval": 30,
 
-    // [Optional] Number of consecutive missed getPilot responses before a
-    // bulb is marked as unreachable. Only applies when reportOffline is true.
+    // [Optional] Number of consecutive missed pings before a device is marked
+    // offline and shown as "No Response" in Apple Home. The plugin keeps
+    // probing in the background and clears the state automatically when the
+    // device replies again. Recovery requires refreshInterval > 0, otherwise
+    // the device only recovers when HomeKit actively queries it.
     // Default: 3
-    "offlineThreshold": 3,
+    "pingFailuresBeforeOffline": 3,
   }
 ```
 
@@ -85,13 +95,16 @@ The Wiz bulbs strongly distinguish between RGB color modes and Kelvin color mode
 
 Luckily, even if we only enable the color mode, we still get a nice temperature picker. Problem is, the color temperature is given in standard HSV. As such, this app will try to guess which one to best use given a color, and you will notice some significant brightness variance switching between a "temp" hue and a "color" hue.
 
-**In particular, since the Wiz bulbs only support up to 6500K, this means that only the top-ish half of the temperature picker is actually bright**
+**In particular, since the Wiz bulbs only support 2200K–6500K, this means that only the top-ish half of the temperature picker is actually bright**
 
 ### Last Status (config setting)
-If a "rhythm" is selected in the Wiz app and `lastStatus` is set to `true`, the lights will always turn on to the rhythm. When rhythms are disabled, lights turn on to whatever setting they had when last turned off.
+If a "rhythm" is selected in the Wiz app and `lastStatus` is set to `true`, the lights will always turn on to the rhythm. When rhythms are disabled, lights turn on to whatever setting they had when last turned off. Only applies to pure on/off toggles — any brightness/color/temperature change still goes through normally.
 
-### Report Offline (config setting)
-By default, when a bulb stops responding to UDP requests the plugin silently replays its last known state — so a bulb that's been unplugged or dropped off the network still appears fully operational in HomeKit. Setting `reportOffline: true` changes this: after `offlineThreshold` consecutive missed responses the accessory is surfaced to HomeKit as "Not Responding", and a successful reply clears the state immediately. Pair with `refreshInterval > 0` so background pings can detect unreachable bulbs even when HomeKit isn't actively reading them. When `refreshInterval > 0`, the plugin also re-broadcasts discovery on each tick so bulbs that return to the network (or get a new DHCP lease) are re-learned automatically.
+### Offline detection (config setting)
+By default, when a bulb stops responding to UDP requests the plugin replays its last known state — so a bulb that's been unplugged or dropped off the network still appears fully operational in HomeKit. With `refreshInterval > 0`, after `pingFailuresBeforeOffline` consecutive missed responses the accessory is surfaced to HomeKit as "Not Responding", and a successful reply clears the state immediately. Pair with `discoveryInterval > 0` so bulbs that return to the network (or get a new DHCP lease) are re-learned automatically.
+
+### Adaptive Lighting
+Automatically enabled for RGB and Tunable White bulbs. If you (or another app) change the bulb's color or temperature outside of Adaptive Lighting's schedule, it deactivates itself so you stay in control. HomeKit can re-enable it from the bulb's settings.
 
 # Development
 Ideas from http://blog.dammitly.net/2019/10/cheap-hackable-wifi-light-bulbs-or-iot.html?m=1
