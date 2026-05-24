@@ -88,8 +88,19 @@ export default class HomebridgeWizLan {
 
   initDiscoveryInterval() {
     const interval = Number(this.config.discoveryInterval ?? 0);
+    const refresh = Number(this.config.refreshInterval ?? 0);
     if (!(interval > 0)) {
       this.log.info("[Discovery] Periodic re-discovery is off");
+      if (refresh > 0) {
+        // Prior to 3.4.0 the refresh tick also re-broadcast discovery, so
+        // bulbs that came back with a new DHCP lease were re-learned for
+        // free. That coupling is gone — opt into discoveryInterval to keep it.
+        this.log.warn(
+          "[Discovery] refreshInterval is set but discoveryInterval is 0. " +
+          "Bulbs that change IP (e.g. new DHCP lease) will not be re-learned automatically — " +
+          "set discoveryInterval > 0 to restore the pre-3.4.0 behavior."
+        );
+      }
     } else {
       this.log.info(`[Discovery] Re-broadcasting every ${interval} seconds`);
       const timer = setInterval(() => {

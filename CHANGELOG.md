@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.4.0
+- [FEAT] Near-instant getPilot response — replaces the 50 ms debounce with in-flight request deduplication, and coalesces rapid setPilot calls so slider drags emit at most two UDP packets per device
+- [FEAT] `discoveryInterval` config option — periodically re-broadcasts the UDP discovery packet so devices added after Homebridge starts are picked up automatically
+- [FEAT] Offline detection rewritten around consecutive ping failures (configurable via `pingFailuresBeforeOffline`); offline devices fail HomeKit reads immediately as "No Response" and recover automatically
+- [FIX] `lastStatus` no longer strips brightness/color/temperature changes — it now only applies to pure on/off toggles
+- [FIX] `transformDimming` clamps to ≥ 0 so a device reporting `dimming=0` no longer sends a negative brightness to HomeKit
+- [FIX] Refresh and discovery intervals are now cleared on Homebridge shutdown
+- **Breaking:** `reportOffline` and `offlineThreshold` config keys are removed. Any `refreshInterval > 0` now activates offline reporting unconditionally (controlled by `pingFailuresBeforeOffline`, default 3). The refresh tick no longer re-broadcasts discovery — enable `discoveryInterval > 0` to keep the pre-3.4.0 DHCP-lease recovery behavior; the plugin logs a startup warning if you have refresh on without discovery.
+- Thank you [@ulm0](https://github.com/ulm0) for [#175](https://github.com/kpsuperplane/homebridge-wiz-lan/pull/175)
+
 ## 3.3.4
 - [FEAT] Optionally surface unreachable bulbs as "Not Responding" in HomeKit via new `reportOffline` config flag
 - [FIX] Filter undefined fields before merging cached pilot state (prevents NaN brightness when firmware omits `dimming`)

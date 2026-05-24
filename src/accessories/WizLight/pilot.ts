@@ -51,7 +51,7 @@ export const disabledAdaptiveLightingCallback: {
   [mac: string]: () => void;
 } = {};
 
-export function updatePilot(
+function updatePilot(
   wiz: HomebridgeWizLan,
   accessory: PlatformAccessory,
   device: Device,
@@ -122,7 +122,7 @@ export function getPilot(
 
   _getPilot<Pilot>(wiz, device, (error, pilot) => {
     if (error !== null) {
-      const threshold = wiz.config.pingFailuresBeforeOffline ?? 3;
+      const threshold = Math.max(1, Number(wiz.config.pingFailuresBeforeOffline ?? 3));
       const newlyOffline = recordFailure(device.mac, threshold);
       if (newlyOffline) {
         wiz.log.warn(`[${device.mac}] Device is now offline (${threshold} missed pings)`);
@@ -225,7 +225,13 @@ export function setPilot(
   });
 }
 
-export function pilotToColor(pilot: Pilot) {
+export function pilotToColor(pilot: Pilot | undefined) {
+  // Neutral-white fallback when the cache entry is missing — defends
+  // updateColorTemp() against a setPilot callback firing after the cache
+  // was cleared (regression guard for issue #145).
+  if (!pilot) {
+    return { hue: 0, saturation: 0, temp: 2700 };
+  }
   if (typeof pilot.temp === "number") {
     return {
       ...rgbToHsv(colorTemperature2rgb(Number(pilot.temp))),

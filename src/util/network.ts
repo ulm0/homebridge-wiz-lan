@@ -7,7 +7,7 @@ import { Pilot as SocketPilot } from "../accessories/WizSocket/pilot";
 import { Device } from "../types";
 import HomebridgeWizLan from "../wiz";
 import { makeLogger } from "./logger";
-import { recordHit } from "./reachability";
+import { recordSuccess } from "./offline";
 
 function strMac() {
   return getMac().toUpperCase().replace(/:/g, "");
@@ -198,8 +198,8 @@ export function registerDiscoveryHandler(
       if (response.method === "registration") {
         const mac = response.result.mac;
         // Any registration reply means the bulb just responded on the network,
-        // so any prior miss streak is no longer valid.
-        recordHit(mac);
+        // so any prior failure streak is no longer valid.
+        recordSuccess(mac);
         log.debug(`[${ip}@${mac}] Sending config request (getSystemConfig)`);
         // Send system config request
         wiz.socket.send(
@@ -209,7 +209,7 @@ export function registerDiscoveryHandler(
         );
       } else if (response.method === "getSystemConfig") {
         const mac = response.result.mac;
-        recordHit(mac);
+        recordSuccess(mac);
         log.debug(`[${ip}@${mac}] Received config`);
         addDevice({
           ip,

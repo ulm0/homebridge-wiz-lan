@@ -144,6 +144,9 @@ Thanks to:
 #### [@dhananjaysathe](https://github.com/dhananjaysathe)
 [#173 Surface unreachable bulbs as 'Not Responding' via HAP](https://github.com/kpsuperplane/homebridge-wiz-lan/pull/173)
 
+#### [@ulm0](https://github.com/ulm0)
+[#175 Enhance device responsiveness and add offline detection features](https://github.com/kpsuperplane/homebridge-wiz-lan/pull/175)
+
 ## Contributing
 
 Mostly built for my own personal use, I'll probably reply to any created issues but probably will not actively support anything outside of the RGB bulbs. If you'd like to make a PR through, <3

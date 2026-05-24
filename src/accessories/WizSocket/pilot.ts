@@ -25,7 +25,7 @@ export interface Pilot extends WizPilot {
 // to default values
 export const cachedPilot: { [mac: string]: Pilot } = {};
 
-export function updatePilot(
+function updatePilot(
   wiz: HomebridgeWizLan,
   accessory: PlatformAccessory,
   _: Device,
@@ -58,7 +58,7 @@ export function getPilot(
 
   _getPilot<Pilot>(wiz, device, (error, pilot) => {
     if (error !== null) {
-      const threshold = wiz.config.pingFailuresBeforeOffline ?? 3;
+      const threshold = Math.max(1, Number(wiz.config.pingFailuresBeforeOffline ?? 3));
       const newlyOffline = recordFailure(device.mac, threshold);
       if (newlyOffline) {
         wiz.log.warn(`[${device.mac}] Device is now offline (${threshold} missed pings)`);
