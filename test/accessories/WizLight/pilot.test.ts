@@ -57,7 +57,7 @@ beforeEach(() => {
   _recordSuccess(`${TEST_MAC}T1`);
   _recordSuccess(`${TEST_MAC}T2`);
   _recordSuccess(`${TEST_MAC}T3`);
-  for (const s of ["F1", "F2", "F3", "F4", "F5"]) {
+  for (const s of ["F1", "F2", "F3", "F4", "F5", "F6"]) {
     _recordSuccess(`${TEST_MAC}${s}`);
   }
 });
@@ -154,22 +154,25 @@ describe("WizLight/pilot: getPilot success path", () => {
 });
 
 describe("WizLight/pilot: error fallback & offline handling", () => {
-  it("falls back to cached state when the network errors and a cache exists", () => {
+  it("serves cached state (cache-first) and stays silent when the probe later errors under threshold", () => {
     const wiz = makeFakeWiz();
     const accessory = makeAccessoryWithService("Lightbulb");
     const device = makeDevice({ mac: `${TEST_MAC}T1` });
     cachedPilot[device.mac] = makeLightPilot({ mac: device.mac, state: true });
     let received: any = null;
+    const onError = mock((_: Error) => {});
     getPilot(
       wiz,
       accessory as any,
       device,
       (p) => (received = p),
-      () => {},
+      onError,
     );
     pendingGet[0](new Error("timeout"), null);
     expect(received).toBeDefined();
     expect(received.state).toBe(true);
+    // The probe error must not surface after HomeKit was already answered.
+    expect(onError).not.toHaveBeenCalled();
   });
 
   it("calls onError when the network errors and no cache exists", () => {
@@ -302,6 +305,77 @@ describe("WizLight/pilot: offline fast-path & recovery", () => {
     expect(err).not.toBeNull();
     expect(err.hapStatus).toBeDefined();
     expect(isOffline(mac)).toBe(true);
+  });
+});
+
+describe("WizLight/pilot: cache-first responses", () => {
+  it("answers synchronously from cache while the probe is still in flight", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: TEST_MAC });
+    cachedPilot[TEST_MAC] = makeLightPilot({ mac: TEST_MAC, dimming: 60 });
+    let received: any = null;
+    getPilot(
+      wiz,
+      accessory as any,
+      device,
+      (p) => (received = p),
+      () => {},
+    );
+    // Answered before any UDP reply was simulated...
+    expect(received).not.toBeNull();
+    expect(received.dimming).toBe(60);
+    // ...while the probe is still in flight to refresh state.
+    expect(pendingGet.length).toBe(1);
+  });
+
+  it("pushes the probe result to the characteristics after answering from cache", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: TEST_MAC });
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      state: false,
+      dimming: 20,
+    });
+    getPilot(
+      wiz,
+      accessory as any,
+      device,
+      () => {},
+      () => {},
+    );
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, state: true, dimming: 42 }));
+    expect(cachedPilot[TEST_MAC].dimming).toBe(42);
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
+      .toHaveBeenCalled();
+    expect(svc.getCharacteristic(wiz.Characteristic.Brightness).updateValue)
+      .toHaveBeenCalled();
+  });
+
+  it("counts a shared probe error once even when several callbacks coalesced on it", () => {
+    const mac = `${TEST_MAC}F6`;
+    const wiz = makeFakeWiz({ pingFailuresBeforeOffline: 2 } as any);
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac });
+    // Two HomeKit GETs coalesce onto one UDP probe; on timeout the network
+    // layer hands the SAME Error instance to both callbacks.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    const shared = new Error("timeout");
+    pendingGet[0](shared, null);
+    pendingGet[1](shared, null);
+    // One dropped packet = one failure, so threshold 2 is NOT crossed.
+    expect(isOffline(mac)).toBe(false);
+
+    // A second dropped probe (fresh Error) is a genuine second failure.
+    pendingGet.length = 0;
+    let err: any = null;
+    getPilot(wiz, accessory as any, device, () => {}, (e) => (err = e));
+    pendingGet[0](new Error("timeout"), null);
+    expect(isOffline(mac)).toBe(true);
+    expect(err.hapStatus).toBeDefined();
   });
 });
 

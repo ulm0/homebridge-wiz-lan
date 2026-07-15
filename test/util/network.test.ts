@@ -82,6 +82,48 @@ describe("network: getPilot in-flight dedup", () => {
     expect(errors[0]).not.toBeNull();
     expect(errors[1]).not.toBeNull();
     expect(errors[0]!.message).toMatch(/No response/);
+    // All coalesced callbacks must receive the SAME Error instance — the
+    // accessory layer dedupes offline-failure counting on it, so one dropped
+    // packet counts as one failure rather than one per characteristic.
+    expect(errors[0]).toBe(errors[1]!);
+  }, 5000);
+});
+
+describe("network: getPilot retransmits", () => {
+  it("retransmits the request once while unanswered (2 packets inside the 1s window)", async () => {
+    const wiz = makeFakeWiz(baseConfig());
+    const device = uniqueDevice();
+    getPilot(wiz, device, () => {});
+    // The retransmit fires at 400ms; sample well past it but before the 1s
+    // deadline.
+    await new Promise((r) => setTimeout(r, 750));
+    const sends = (wiz.socket as FakeSocket).sent.filter((s) =>
+      s.msg.includes('"getPilot"'),
+    );
+    expect(sends.length).toBe(2);
+    expect(sends.every((s) => s.ip === device.ip)).toBe(true);
+  }, 5000);
+
+  it("stops retransmitting once a reply arrives", async () => {
+    const wiz = makeFakeWiz(baseConfig());
+    registerDiscoveryHandler(wiz, () => {});
+    const device = uniqueDevice();
+    getPilot(wiz, device, () => {});
+    wiz.socket.emit(
+      "message",
+      Buffer.from(
+        JSON.stringify({
+          method: "getPilot",
+          result: { mac: device.mac, state: true },
+        }),
+      ),
+      { address: device.ip, port: 38899 },
+    );
+    await new Promise((r) => setTimeout(r, 800));
+    expect(
+      (wiz.socket as FakeSocket).sent.filter((s) => s.msg.includes('"getPilot"'))
+        .length,
+    ).toBe(1);
   }, 5000);
 });
 
@@ -119,6 +161,127 @@ describe("network: setPilot payload composition", () => {
     // First one fires; rest stay in setPilotPending until the first completes
     expect(sends.length).toBe(1);
   });
+});
+
+describe("network: setPilot ack timeout", () => {
+  it("errors the callback and frees the queue when the ack never arrives", async () => {
+    const wiz = makeFakeWiz(baseConfig());
+    const device = uniqueDevice({ ip: "10.7.7.1" });
+    let err: Error | null | undefined = undefined;
+    setPilot(wiz, device, { state: true } as any, (e) => (err = e));
+    await new Promise((r) => setTimeout(r, 2150));
+    expect(err).toBeInstanceOf(Error);
+    expect((err as unknown as Error).message).toMatch(/No setPilot response/);
+    // The queue must be freed: a new command goes out immediately instead of
+    // being parked behind the dead entry.
+    setPilot(wiz, device, { state: false } as any, () => {});
+    const sends = (wiz.socket as FakeSocket).sent.filter((s) =>
+      s.msg.includes('"setPilot"'),
+    );
+    expect(sends.length).toBe(2);
+  }, 10000);
+
+  it("a command queued behind a lost ack is transmitted after the timeout instead of being parked forever", async () => {
+    const wiz = makeFakeWiz(baseConfig());
+    registerDiscoveryHandler(wiz, () => {});
+    const device = uniqueDevice({ ip: "10.7.7.2" });
+    let errA: Error | null | undefined = undefined;
+    let errB: Error | null | undefined = undefined;
+    setPilot(wiz, device, { state: true } as any, (e) => (errA = e));
+    setPilot(wiz, device, { dimming: 42 } as any, (e) => (errB = e));
+    // Only the first command is on the wire; the second is pending.
+    expect(
+      (wiz.socket as FakeSocket).sent.filter((s) => s.msg.includes('"setPilot"'))
+        .length,
+    ).toBe(1);
+
+    await new Promise((r) => setTimeout(r, 2150));
+    // First command timed out...
+    expect(errA).toBeInstanceOf(Error);
+    // ...and the pending command was flushed onto the wire.
+    const sends = (wiz.socket as FakeSocket).sent.filter((s) =>
+      s.msg.includes('"setPilot"'),
+    );
+    expect(sends.length).toBe(2);
+    expect(JSON.parse(sends[1].msg).params.dimming).toBe(42);
+
+    // Its ack resolves its callback normally.
+    wiz.socket.emit(
+      "message",
+      Buffer.from(JSON.stringify({ method: "setPilot", result: {} })),
+      { address: device.ip, port: 38899 },
+    );
+    expect(errB).toBeNull();
+  }, 10000);
+
+  it("an ack clears the deadline, so a later command is not errored by the earlier command's stale timer", async () => {
+    const wiz = makeFakeWiz(baseConfig());
+    registerDiscoveryHandler(wiz, () => {});
+    const device = uniqueDevice({ ip: "10.7.7.3" });
+    const ack = () =>
+      wiz.socket.emit(
+        "message",
+        Buffer.from(JSON.stringify({ method: "setPilot", result: {} })),
+        { address: device.ip, port: 38899 },
+      );
+
+    let errA: Error | null | undefined = undefined;
+    let errB: Error | null | undefined = undefined;
+    setPilot(wiz, device, { state: true } as any, (e) => (errA = e));
+    ack();
+    expect(errA).toBeNull();
+
+    // Send B well after A so their deadlines don't overlap: A's stale timer
+    // (had it leaked) would fire at t=2000ms, before B's own at t=2700ms.
+    await new Promise((r) => setTimeout(r, 700));
+    setPilot(wiz, device, { state: false } as any, (e) => (errB = e));
+    await new Promise((r) => setTimeout(r, 1550)); // t≈2250ms
+    expect(errB).toBeUndefined();
+    ack();
+    expect(errB).toBeNull();
+  }, 10000);
+
+  it("a send error clears the deadline, so a later command is not errored by the stale timer", async () => {
+    const wiz = makeFakeWiz(baseConfig());
+    registerDiscoveryHandler(wiz, () => {});
+    const device = uniqueDevice({ ip: "10.7.7.4" });
+    const sock = wiz.socket as FakeSocket;
+    // Fail exactly one send at the socket level.
+    let failNext = true;
+    const realSend = sock.send;
+    (sock as any).send = (
+      msg: string | Buffer,
+      port: number,
+      ip: string,
+      cb?: (err: Error | null) => void,
+    ) => {
+      if (failNext) {
+        failNext = false;
+        sock.sent.push({ msg: msg.toString(), port, ip });
+        cb?.(new Error("EHOSTUNREACH"));
+        return;
+      }
+      realSend(msg, port, ip, cb);
+    };
+
+    let errA: Error | null | undefined = undefined;
+    let errB: Error | null | undefined = undefined;
+    setPilot(wiz, device, { state: true } as any, (e) => (errA = e));
+    expect(errA).toBeInstanceOf(Error);
+
+    // A's stale timer (had it leaked) would fire at t=2000ms, before B's own
+    // deadline at t=2700ms.
+    await new Promise((r) => setTimeout(r, 700));
+    setPilot(wiz, device, { state: false } as any, (e) => (errB = e));
+    await new Promise((r) => setTimeout(r, 1550)); // t≈2250ms
+    expect(errB).toBeUndefined();
+    wiz.socket.emit(
+      "message",
+      Buffer.from(JSON.stringify({ method: "setPilot", result: {} })),
+      { address: device.ip, port: 38899 },
+    );
+    expect(errB).toBeNull();
+  }, 10000);
 });
 
 describe("network: discovery message routing", () => {

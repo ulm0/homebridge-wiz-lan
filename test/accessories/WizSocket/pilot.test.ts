@@ -73,21 +73,24 @@ describe("WizSocket/pilot: getPilot", () => {
     expect(cachedPilot[TEST_MAC].state).toBe(true);
   });
 
-  it("falls back to cached state when the network errors and a cache exists", () => {
+  it("serves cached state (cache-first) and stays silent when the probe later errors under threshold", () => {
     const wiz = makeFakeWiz();
     const accessory = makeOutletAccessory();
     const device = makeDevice({ mac: `${TEST_MAC}_T1`, model: "ESP10_SOCKET_06" });
     cachedPilot[device.mac] = makeSocketPilot({ mac: device.mac, state: true });
     let received: any = null;
+    const onError = mock((_: Error) => {});
     getPilot(
       wiz,
       accessory as any,
       device,
       (p) => (received = p),
-      () => {},
+      onError,
     );
     pendingGet[0](new Error("timeout"), null);
     expect(received?.state).toBe(true);
+    // The probe error must not surface after HomeKit was already answered.
+    expect(onError).not.toHaveBeenCalled();
   });
 
   it("calls onError when the network errors and no cache exists", () => {
@@ -104,6 +107,44 @@ describe("WizSocket/pilot: getPilot", () => {
     );
     pendingGet[0](new Error("timeout"), null);
     expect(err).not.toBeNull();
+  });
+});
+
+describe("WizSocket/pilot: cache-first responses", () => {
+  it("answers synchronously from cache while the probe is still in flight", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP10_SOCKET_06" });
+    cachedPilot[TEST_MAC] = makeSocketPilot({ mac: TEST_MAC, state: true });
+    let received: any = null;
+    getPilot(
+      wiz,
+      accessory as any,
+      device,
+      (p) => (received = p),
+      () => {},
+    );
+    expect(received?.state).toBe(true);
+    expect(pendingGet.length).toBe(1);
+  });
+
+  it("pushes the probe result to the Outlet characteristic after answering from cache", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP10_SOCKET_06" });
+    cachedPilot[TEST_MAC] = makeSocketPilot({ mac: TEST_MAC, state: false });
+    getPilot(
+      wiz,
+      accessory as any,
+      device,
+      () => {},
+      () => {},
+    );
+    pendingGet[0](null, makeSocketPilot({ mac: TEST_MAC, state: true }));
+    expect(cachedPilot[TEST_MAC].state).toBe(true);
+    const svc = accessory.getService(wiz.Service.Outlet)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
+      .toHaveBeenCalled();
   });
 });
 

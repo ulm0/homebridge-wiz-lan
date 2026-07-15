@@ -1,7 +1,7 @@
 import { PlatformAccessory } from "homebridge";
 
 import HomebridgeWizLan from "../../wiz";
-import { isOffline, recordFailure, recordSuccess } from "../../util/offline";
+import { isOffline, recordFailureOnce, recordSuccess } from "../../util/offline";
 import { Device } from "../../types";
 import {
   getPilot as _getPilot,
@@ -113,36 +113,43 @@ export function getPilot(
   onError: (error: Error) => void
 ) {
   const deviceIsOffline = isOffline(device.mac);
+  // Once HomeKit has been answered, the probe below only refreshes
+  // characteristics via updatePilot — the callbacks must not fire twice.
+  let responded = false;
 
   if (deviceIsOffline) {
     // Respond immediately so HomeKit doesn't wait for the UDP timeout
     onError(new wiz.api.hap.HapStatusError(wiz.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE));
+    responded = true;
     // Fall through to still probe the device so recovery is detected
+  } else if (typeof cachedPilot[device.mac] !== "undefined") {
+    // Answer from cache right away instead of holding HomeKit ("Updating...")
+    // through a live UDP round trip; the probe pushes fresh state when it lands
+    onSuccess(cachedPilot[device.mac]);
+    responded = true;
   }
 
   _getPilot<Pilot>(wiz, device, (error, pilot) => {
     if (error !== null) {
       const threshold = Math.max(1, Number(wiz.config.pingFailuresBeforeOffline ?? 3));
-      const newlyOffline = recordFailure(device.mac, threshold);
+      const newlyOffline = recordFailureOnce(error, device.mac, threshold);
       if (newlyOffline) {
         wiz.log.warn(`[${device.mac}] Device is now offline (${threshold} missed pings)`);
         updatePilot(wiz, accessory, device, new wiz.api.hap.HapStatusError(wiz.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE));
-        if (!deviceIsOffline) {
+        if (!responded) {
           onError(new wiz.api.hap.HapStatusError(wiz.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE));
         }
         return;
       }
-      if (deviceIsOffline) {
-        // Still offline — already responded above, nothing else to do
+      if (responded) {
+        // HomeKit already got the cached state (or the offline error)
+        wiz.log.debug(`[getPilot] No response from ${device.mac}, HomeKit was answered from cache`);
         return;
       }
-      const cached = cachedPilot[device.mac];
-      if (cached) {
-        wiz.log.warn(`[getPilot] No response from ${device.mac} within 1s, using cached state`);
-        onSuccess(cached);
-      } else {
-        onError(error);
-      }
+      // responded=false means no cache existed when the probe started (a
+      // probe success would have resolved this same coalesced batch), so
+      // there is no cached state to fall back on
+      onError(error);
       return;
     }
 
@@ -166,11 +173,11 @@ export function getPilot(
       dimming: (pilot.state ?? old?.state) ? 100 : 10,
       ...pilot
     };
-    if (cameBack) {
-      // Push fresh state to HomeKit so "No Response" clears immediately
+    if (responded) {
+      // HomeKit was answered from cache (or shown "No Response") — push the
+      // fresh state so the tile converges on reality
       updatePilot(wiz, accessory, device, pilot);
-    }
-    if (!deviceIsOffline) {
+    } else {
       onSuccess(pilot);
     }
   });
