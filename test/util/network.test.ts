@@ -13,9 +13,15 @@ import {
   setPilot,
 } from "../../src/util/network";
 import {
+  cachedPilot,
+  setPilot as setLightPilot,
+} from "../../src/accessories/WizLight/pilot";
+import {
   FakeSocket,
+  makeAccessoryWithService,
   makeDevice,
   makeFakeWiz,
+  makeLightPilot,
 } from "../__helpers__/factories";
 
 // The util/network module keeps per-mac/per-ip callback queues at module
@@ -212,6 +218,62 @@ describe("network: setPilot ack timeout", () => {
       { address: device.ip, port: 38899 },
     );
     expect(errB).toBeNull();
+  }, 10000);
+
+  it("preserves a newer queued write when the preceding ack times out", async () => {
+    const wiz = makeFakeWiz(baseConfig());
+    registerDiscoveryHandler(wiz, () => {});
+    const device = uniqueDevice({ ip: "10.7.7.10" });
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[device.mac] = makeLightPilot({
+      mac: device.mac,
+      state: false,
+      dimming: 20,
+    });
+
+    let firstError: Error | null | undefined;
+    let secondError: Error | null | undefined;
+    setLightPilot(
+      wiz,
+      accessory as any,
+      device,
+      { state: true },
+      (error) => (firstError = error),
+    );
+    setLightPilot(
+      wiz,
+      accessory as any,
+      device,
+      { dimming: 80 },
+      (error) => (secondError = error),
+    );
+
+    expect(cachedPilot[device.mac].state).toBe(true);
+    expect(cachedPilot[device.mac].dimming).toBe(80);
+
+    await new Promise((resolve) => setTimeout(resolve, 2150));
+    expect(firstError).toBeInstanceOf(Error);
+
+    const sends = (wiz.socket as FakeSocket).sent.filter((sent) =>
+      sent.msg.includes('"setPilot"'),
+    );
+    expect(sends).toHaveLength(2);
+    expect(JSON.parse(sends[1].msg).params).toMatchObject({
+      state: true,
+      dimming: 80,
+    });
+
+    wiz.socket.emit(
+      "message",
+      Buffer.from(JSON.stringify({ method: "setPilot", result: {} })),
+      { address: device.ip, port: 38899 },
+    );
+    expect(secondError).toBeNull();
+
+    // B was sent and acknowledged, so A's timeout must not restore the cache
+    // snapshot that predates both writes.
+    expect(cachedPilot[device.mac].state).toBe(true);
+    expect(cachedPilot[device.mac].dimming).toBe(80);
   }, 10000);
 
   it("an ack clears the deadline, so a later command is not errored by the earlier command's stale timer", async () => {
