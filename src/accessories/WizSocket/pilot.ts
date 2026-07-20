@@ -127,12 +127,18 @@ export function setPilot(
     sceneId: undefined,
   };
 
-  cachedPilot[device.mac] = {
+  const optimisticPilot = {
     ...oldPilot,
     ...newPilot,
-  } as any;
+  } as Pilot;
+  cachedPilot[device.mac] = optimisticPilot;
   return _setPilot(wiz, device, newPilot, (error) => {
-    if (error !== null) {
+    // Roll back only while this write still owns the cache entry. A newer
+    // queued write (or a fresh getPilot) may have replaced it by the time
+    // this write times out — the queued command is still transmitted after
+    // the failure and can succeed, so restoring this write's older snapshot
+    // would leave the cache behind the confirmed device state.
+    if (error !== null && cachedPilot[device.mac] === optimisticPilot) {
       cachedPilot[device.mac] = oldPilot;
     }
     callback(error);

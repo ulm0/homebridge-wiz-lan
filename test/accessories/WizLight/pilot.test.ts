@@ -477,6 +477,27 @@ describe("WizLight/pilot: setPilot scene/color exclusivity", () => {
     pendingSet[0](new Error("boom"));
     expect(cachedPilot[TEST_MAC]).toBe(oldPilot);
   });
+
+  it("does not revert the cache when a newer write replaced it before the failure", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      state: false,
+      dimming: 20,
+    });
+    setPilot(wiz, accessory as any, baseDevice, { state: true }, () => {});
+    setPilot(wiz, accessory as any, baseDevice, { dimming: 80 }, () => {});
+    // The second write owns the cache now; the first write's failure must not
+    // restore the snapshot that predates both writes.
+    pendingSet[0](new Error("ack timeout"));
+    expect(cachedPilot[TEST_MAC].state).toBe(true);
+    expect(cachedPilot[TEST_MAC].dimming).toBe(80);
+    // The second write succeeding leaves its own optimistic state in place.
+    pendingSet[1](null);
+    expect(cachedPilot[TEST_MAC].state).toBe(true);
+    expect(cachedPilot[TEST_MAC].dimming).toBe(80);
+  });
 });
 
 describe("WizLight/pilot: updateColorTemp", () => {
