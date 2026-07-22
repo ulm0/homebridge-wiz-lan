@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.4.1
+- [FIX] Add a 2-second `setPilot` acknowledgement timeout so lost UDP acknowledgements no longer wedge later commands, while preserving newer queued cache state
+- [FIX] Retransmit `getPilot` once and serve cached state immediately while refreshing HomeKit in the background, reducing "Updating…" delays on lossy Wi-Fi
+- [FIX] Count coalesced probe timeouts once so one dropped reply no longer falsely marks a device offline
+- Thank you [@ulm0](https://github.com/ulm0) for [#176](https://github.com/kpsuperplane/homebridge-wiz-lan/pull/176)
+
 ## 3.4.0
 - [FEAT] Near-instant getPilot response — replaces the 50 ms debounce with in-flight request deduplication, and coalesces rapid setPilot calls so slider drags emit at most two UDP packets per device
 - [FEAT] `discoveryInterval` config option — periodically re-broadcasts the UDP discovery packet so devices added after Homebridge starts are picked up automatically
