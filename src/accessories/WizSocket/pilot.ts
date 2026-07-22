@@ -25,6 +25,14 @@ export interface Pilot extends WizPilot {
 // to default values
 export const cachedPilot: { [mac: string]: Pilot } = {};
 
+// Bumped on every transmitted setPilot. A getPilot probe captures the value
+// when it starts; if a write advanced it before the reply returns, the device
+// generated that reply before the write reached it. Committing such a reply
+// would roll cachedPilot — and the HomeKit tile — back to pre-write state
+// (cache-first reads leave probes in flight long enough for a user write to
+// interleave, and its ack can beat the delayed reply).
+export const writeGeneration: { [mac: string]: number } = {};
+
 function updatePilot(
   wiz: HomebridgeWizLan,
   accessory: PlatformAccessory,
@@ -65,6 +73,8 @@ export function getPilot(
     responded = true;
   }
 
+  const generationAtProbeStart = writeGeneration[device.mac] ?? 0;
+
   _getPilot<Pilot>(wiz, device, (error, pilot) => {
     if (error !== null) {
       const threshold = Math.max(1, Number(wiz.config.pingFailuresBeforeOffline ?? 3));
@@ -92,6 +102,21 @@ export function getPilot(
     const cameBack = recordSuccess(device.mac);
     if (cameBack) {
       wiz.log.info(`[${device.mac}] Device is back online`);
+    }
+    if ((writeGeneration[device.mac] ?? 0) !== generationAtProbeStart) {
+      // A write went out while this probe was in flight, so the reply is
+      // stale even though it arrived last. Drop it — the next probe reports
+      // post-write truth — but recordSuccess above still counted the reply
+      // for offline tracking (the device did answer).
+      wiz.log.debug(
+        `[getPilot] Discarding stale reply from ${device.mac}: a write raced ahead of it`
+      );
+      if (!responded) {
+        // HomeKit is still waiting on this GET — answer with the freshest
+        // known state instead of the pre-write reply.
+        onSuccess(cachedPilot[device.mac] ?? pilot);
+      }
+      return;
     }
     cachedPilot[device.mac] = pilot;
     if (responded) {
@@ -131,6 +156,11 @@ export function setPilot(
     ...oldPilot,
     ...newPilot,
   } as Pilot;
+  // Mark in-flight probes stale before the cache commit: their replies
+  // predate this write, and a delayed one landing after the ack must not
+  // clobber the newer state. Not undone on rollback — a timed-out write may
+  // still have reached the device, so pre-write replies stay untrustworthy.
+  writeGeneration[device.mac] = (writeGeneration[device.mac] ?? 0) + 1;
   cachedPilot[device.mac] = optimisticPilot;
   return _setPilot(wiz, device, newPilot, (error) => {
     // Roll back only while this write still owns the cache entry. A newer

@@ -33,6 +33,7 @@ import {
   pilotToColor,
   setPilot,
   updateColorTemp,
+  writeGeneration,
 } from "../../../src/accessories/WizLight/pilot";
 import { isOffline, recordFailure, recordSuccess as _recordSuccess } from "../../../src/util/offline";
 import {
@@ -46,6 +47,7 @@ const TEST_MAC = "AABBCCDDEEFF";
 
 beforeEach(() => {
   for (const k of Object.keys(cachedPilot)) delete cachedPilot[k];
+  for (const k of Object.keys(writeGeneration)) delete writeGeneration[k];
   for (const k of Object.keys(disabledAdaptiveLightingCallback))
     delete disabledAdaptiveLightingCallback[k];
   pendingGet.length = 0;
@@ -497,6 +499,133 @@ describe("WizLight/pilot: setPilot scene/color exclusivity", () => {
     pendingSet[1](null);
     expect(cachedPilot[TEST_MAC].state).toBe(true);
     expect(cachedPilot[TEST_MAC].dimming).toBe(80);
+  });
+});
+
+describe("WizLight/pilot: stale probe replies vs. interleaved writes", () => {
+  const device = makeDevice({ mac: TEST_MAC, model: "ESP01_SHRGB_03" });
+
+  it("discards a delayed pre-write probe reply that lands after a setPilot ack", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      state: false,
+      dimming: 20,
+    });
+    // HomeKit GET is answered from cache; the probe stays in flight.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    expect(pendingGet.length).toBe(1);
+    // The user flips the tile on; the write is acked before the reply lands.
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    expect(cachedPilot[TEST_MAC].state).toBe(true);
+    // Now the delayed probe reply arrives carrying pre-write state.
+    pendingGet[0](
+      null,
+      makeLightPilot({ mac: TEST_MAC, state: false, dimming: 20 }),
+    );
+    // It must neither clobber the cache…
+    expect(cachedPilot[TEST_MAC].state).toBe(true);
+    // …nor push the old value back to the HomeKit characteristics.
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
+      .not.toHaveBeenCalled();
+    expect(svc.getCharacteristic(wiz.Characteristic.Brightness).updateValue)
+      .not.toHaveBeenCalled();
+  });
+
+  it("does not disable adaptive lighting off a stale reply's old color", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      r: 10,
+      g: 10,
+      b: 10,
+    });
+    let adaptiveDisabled = false;
+    disabledAdaptiveLightingCallback[TEST_MAC] = () => {
+      adaptiveDisabled = true;
+    };
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    setPilot(wiz, accessory as any, device, { r: 200, g: 0, b: 0 }, () => {});
+    pendingSet[0](null);
+    // The stale reply repeats the pre-write color, which differs from the
+    // post-write cache — without the generation guard that difference reads
+    // as an external change and kills adaptive lighting.
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, r: 10, g: 10, b: 10 }));
+    expect(adaptiveDisabled).toBe(false);
+    expect(cachedPilot[TEST_MAC].r).toBe(200);
+  });
+
+  it("commits replies from probes started after the write (cache self-heals)", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      state: false,
+      dimming: 20,
+    });
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, state: false, dimming: 20 }));
+    // A probe started after the write is not stale: its reply is device truth.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    pendingGet[1](null, makeLightPilot({ mac: TEST_MAC, state: true, dimming: 35 }));
+    expect(cachedPilot[TEST_MAC].dimming).toBe(35);
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.Brightness).updateValue)
+      .toHaveBeenCalled();
+  });
+
+  it("still discards the stale reply when the interleaved write failed and rolled back", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const oldPilot = makeLightPilot({ mac: TEST_MAC, state: false, dimming: 20 });
+    cachedPilot[TEST_MAC] = oldPilot;
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](new Error("ack timeout"));
+    expect(cachedPilot[TEST_MAC]).toBe(oldPilot);
+    // A timed-out write may still have reached the bulb (lost ack), so this
+    // reply — generated before the write — remains untrustworthy.
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, state: false, dimming: 55 }));
+    expect(cachedPilot[TEST_MAC]).toBe(oldPilot);
+    expect(cachedPilot[TEST_MAC].dimming).toBe(20);
+  });
+
+  it("answers a still-waiting GET with post-write cache state when the reply is stale", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    // No cache at probe start → the GET stays unanswered until the reply.
+    let received: any = null;
+    getPilot(wiz, accessory as any, device, (p) => (received = p), () => {});
+    expect(received).toBeNull();
+    // Cache gets seeded and a write races in while the probe is still out.
+    cachedPilot[TEST_MAC] = makeLightPilot({ mac: TEST_MAC, state: false });
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    // The stale reply must still resolve the GET — with the newer state.
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, state: false }));
+    expect(received).not.toBeNull();
+    expect(received.state).toBe(true);
+  });
+
+  it("a setPilot that fails before transmitting does not mark probes stale", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    let received: any = null;
+    getPilot(wiz, accessory as any, device, (p) => (received = p), () => {});
+    // No cached state → this write errors out synchronously, nothing is sent.
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    expect(setPilotMock).not.toHaveBeenCalled();
+    // The probe reply is not stale — no write actually went out.
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, state: true, dimming: 66 }));
+    expect(received).not.toBeNull();
+    expect(received.dimming).toBe(66);
+    expect(cachedPilot[TEST_MAC].dimming).toBe(66);
   });
 });
 
