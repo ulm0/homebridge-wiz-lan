@@ -105,6 +105,15 @@ export function getPilot<T>(
   );
 }
 
+// The accessory layer snapshots its per-device write generation when a probe
+// is transmitted. Coalesced callers share the in-flight probe's reply — state
+// the bulb read before any write sent since transmission — so they must
+// inherit the transmitting call's snapshot instead of taking their own. This
+// tells them which case they are in.
+export function hasInFlightGetPilot(mac: string): boolean {
+  return mac in getPilotQueue;
+}
+
 const setPilotQueue: {
   [ip: string]: {
     callbacks: ((error: Error | null) => void)[];

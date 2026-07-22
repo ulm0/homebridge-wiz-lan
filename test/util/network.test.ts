@@ -8,6 +8,7 @@ import {
 } from "bun:test";
 import {
   getPilot,
+  hasInFlightGetPilot,
   registerDiscoveryHandler,
   sendDiscoveryBroadcast,
   setPilot,
@@ -62,6 +63,29 @@ describe("network: getPilot in-flight dedup", () => {
       (wiz.socket as FakeSocket).sent.filter((s) => s.msg.includes('"getPilot"'))
         .length,
     ).toBe(1);
+  });
+
+  it("hasInFlightGetPilot tracks the probe lifecycle across coalesced joins", () => {
+    const wiz = makeFakeWiz(baseConfig());
+    registerDiscoveryHandler(wiz, () => {});
+    const device = uniqueDevice();
+    expect(hasInFlightGetPilot(device.mac)).toBe(false);
+    getPilot(wiz, device, () => {});
+    expect(hasInFlightGetPilot(device.mac)).toBe(true);
+    // A piggybacked join keeps the same probe open — no new transmission.
+    getPilot(wiz, device, () => {});
+    expect(hasInFlightGetPilot(device.mac)).toBe(true);
+    wiz.socket.emit(
+      "message",
+      Buffer.from(
+        JSON.stringify({
+          method: "getPilot",
+          result: { mac: device.mac, state: true },
+        }),
+      ),
+      { address: device.ip, port: 38899 },
+    );
+    expect(hasInFlightGetPilot(device.mac)).toBe(false);
   });
 
   it("sends to the device IP on port 38899", () => {

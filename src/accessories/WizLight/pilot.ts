@@ -5,6 +5,7 @@ import { isOffline, recordFailureOnce, recordSuccess } from "../../util/offline"
 import { Device } from "../../types";
 import {
   getPilot as _getPilot,
+  hasInFlightGetPilot,
   setPilot as _setPilot,
 } from "../../util/network";
 import {
@@ -54,6 +55,14 @@ export const cachedPilot: { [mac: string]: Pilot } = {};
 // (cache-first reads leave probes in flight long enough for a user write to
 // interleave, and its ack can beat the delayed reply).
 export const writeGeneration: { [mac: string]: number } = {};
+
+// writeGeneration snapshot taken when the underlying UDP probe was actually
+// transmitted. The network layer coalesces probes per device, so a getPilot
+// call landing while one is in flight shares that probe's reply and must
+// compare against the transmitting call's snapshot — a write can land between
+// transmission and join, and the shared reply predates it for every callback
+// in the batch.
+const probeStartGeneration: { [mac: string]: number } = {};
 
 export const disabledAdaptiveLightingCallback: {
   [mac: string]: () => void;
@@ -137,7 +146,12 @@ export function getPilot(
     responded = true;
   }
 
-  const generationAtProbeStart = writeGeneration[device.mac] ?? 0;
+  // Only the call that actually transmits a probe takes a fresh snapshot;
+  // calls that piggyback on an in-flight probe inherit the starter's.
+  if (!hasInFlightGetPilot(device.mac)) {
+    probeStartGeneration[device.mac] = writeGeneration[device.mac] ?? 0;
+  }
+  const generationAtProbeStart = probeStartGeneration[device.mac] ?? 0;
 
   _getPilot<Pilot>(wiz, device, (error, pilot) => {
     if (error !== null) {

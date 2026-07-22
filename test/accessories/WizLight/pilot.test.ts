@@ -10,9 +10,23 @@ import {
 // network callbacks manually to simulate UDP replies.
 const pendingGet: ((e: Error | null, p: any) => void)[] = [];
 const pendingSet: ((e: Error | null) => void)[] = [];
+// Mirror the real layer's per-mac coalescing: the first unresolved call for a
+// mac transmits the probe and later calls piggyback on it. Firing the
+// transmitting call's callback closes the probe, like the real reply handler
+// deleting the queue entry before running the batch.
+const openGetProbes = new Set<string>();
 const getPilotMock = mock(
-  (_w: any, _d: any, cb: (e: Error | null, p: any) => void) => {
-    pendingGet.push(cb);
+  (_w: any, d: any, cb: (e: Error | null, p: any) => void) => {
+    const startedProbe = !openGetProbes.has(d.mac);
+    if (startedProbe) openGetProbes.add(d.mac);
+    let fired = false;
+    pendingGet.push((e, p) => {
+      if (!fired) {
+        fired = true;
+        if (startedProbe) openGetProbes.delete(d.mac);
+      }
+      cb(e, p);
+    });
   },
 );
 const setPilotMock = mock(
@@ -24,6 +38,7 @@ const setPilotMock = mock(
 mock.module("../../../src/util/network", () => ({
   getPilot: getPilotMock,
   setPilot: setPilotMock,
+  hasInFlightGetPilot: (mac: string) => openGetProbes.has(mac),
 }));
 
 import {
@@ -52,6 +67,7 @@ beforeEach(() => {
     delete disabledAdaptiveLightingCallback[k];
   pendingGet.length = 0;
   pendingSet.length = 0;
+  openGetProbes.clear();
   getPilotMock.mockClear();
   setPilotMock.mockClear();
   // clear offline state for any MAC a test might use
@@ -626,6 +642,37 @@ describe("WizLight/pilot: stale probe replies vs. interleaved writes", () => {
     expect(received).not.toBeNull();
     expect(received.dimming).toBe(66);
     expect(cachedPilot[TEST_MAC].dimming).toBe(66);
+  });
+
+  it("discards the stale reply for callers that piggybacked onto the probe after the write", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      state: false,
+      dimming: 20,
+    });
+    // Caller A transmits the probe before the write.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    // The write goes out and is acked while the probe is still open.
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    // Caller B lands inside the probe window and piggybacks (the real layer
+    // sends no new packet) — it must inherit the probe's pre-write snapshot,
+    // not read the post-write generation and trust the shared reply.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    // The shared pre-write reply resolves the whole batch.
+    const staleReply = makeLightPilot({ mac: TEST_MAC, state: false, dimming: 20 });
+    pendingGet[0](null, staleReply);
+    pendingGet[1](null, staleReply);
+    expect(cachedPilot[TEST_MAC].state).toBe(true);
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
+      .not.toHaveBeenCalled();
+    // A probe transmitted after the write still converges the cache.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    pendingGet[2](null, makeLightPilot({ mac: TEST_MAC, state: true, dimming: 35 }));
+    expect(cachedPilot[TEST_MAC].dimming).toBe(35);
   });
 });
 
