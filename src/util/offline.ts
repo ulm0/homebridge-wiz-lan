@@ -22,3 +22,24 @@ export function recordSuccess(mac: string): boolean {
 export function isOffline(mac: string): boolean {
   return offlineSet.has(mac);
 }
+
+type TrackedError = Error & { wizFailureRecorded?: boolean };
+
+/**
+ * Like recordFailure, but counts a shared probe error only once. All
+ * callbacks coalesced onto one in-flight UDP request receive the same Error
+ * instance, so one dropped packet must count as one failure — not one per
+ * piggybacked characteristic.
+ */
+export function recordFailureOnce(
+  error: Error,
+  mac: string,
+  threshold: number
+): boolean {
+  const tracked = error as TrackedError;
+  if (tracked.wizFailureRecorded) {
+    return false;
+  }
+  tracked.wizFailureRecorded = true;
+  return recordFailure(mac, threshold);
+}

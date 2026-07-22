@@ -28,10 +28,25 @@ function getNetworkConfig({ config }: HomebridgeWizLan) {
   };
 }
 
+const GET_PILOT_TIMEOUT = 1000;
+// getPilot is an idempotent read, so retransmit it once within the timeout
+// window: a single dropped packet then costs ~400ms instead of the full
+// timeout (UDP over Wi-Fi to power-saving bulbs drops packets routinely).
+// Single retransmit only — every extra copy makes the bulb answer the same
+// probe twice, and replies carry no request id, so a duplicate landing while
+// a *later* probe is open would resolve it with stale state.
+const GET_PILOT_RETRANSMIT_DELAYS = [400];
+// setPilot acks also carry no request id (matched by source IP only), so a
+// timed-out command whose ack arrives late can be misattributed to the next
+// command in flight. 2s keeps that window to genuinely lost acks — merely
+// slow ones (1-2s) still resolve correctly — while a truly lost ack errors
+// the HomeKit callback instead of hanging it and wedging the queue forever.
+const SET_PILOT_TIMEOUT = 2000;
+
 const getPilotQueue: {
   [mac: string]: {
     callbacks: ((error: Error | null, pilot: any) => void)[];
-    timeout: NodeJS.Timeout;
+    timers: NodeJS.Timeout[];
   };
 } = {};
 export function getPilot<T>(
@@ -44,27 +59,45 @@ export function getPilot<T>(
     getPilotQueue[device.mac].callbacks.push(callback);
     return;
   }
+  const msg = `{"method":"getPilot","params":{}}`;
   // No in-flight request for this device — fire immediately
-  const timeout = setTimeout(() => {
+  const deadline = setTimeout(() => {
     if (device.mac in getPilotQueue) {
-      const { callbacks } = getPilotQueue[device.mac];
+      const { callbacks, timers } = getPilotQueue[device.mac];
+      timers.forEach(clearTimeout);
       delete getPilotQueue[device.mac];
-      callbacks.forEach((f) => f(new Error(`No response from ${device.mac} within 1s`), null as any));
+      // One shared Error instance for the whole probe — recordFailureOnce
+      // dedupes on it so one dropped packet counts as one failure, not one
+      // per coalesced callback
+      const error = new Error(`No response from ${device.mac} within 1s`);
+      callbacks.forEach((f) => f(error, null as any));
     }
-  }, 1000);
-  getPilotQueue[device.mac] = { callbacks: [callback], timeout };
+  }, GET_PILOT_TIMEOUT);
+  const retransmits = GET_PILOT_RETRANSMIT_DELAYS.map((delay) =>
+    setTimeout(() => {
+      if (device.mac in getPilotQueue) {
+        wiz.log.debug(`[getPilot] Retransmitting getPilot to ${device.mac}`);
+        // Send errors here are ignored — the deadline timer reports failure
+        wiz.socket.send(msg, BROADCAST_PORT, device.ip);
+      }
+    }, delay)
+  );
+  getPilotQueue[device.mac] = {
+    callbacks: [callback],
+    timers: [deadline, ...retransmits],
+  };
   wiz.log.debug(`[getPilot] Sending getPilot to ${device.mac}`);
   wiz.socket.send(
-    `{"method":"getPilot","params":{}}`,
+    msg,
     BROADCAST_PORT,
     device.ip,
     (error: Error | null) => {
       if (error !== null && device.mac in getPilotQueue) {
-        clearTimeout(getPilotQueue[device.mac].timeout);
+        const { callbacks, timers } = getPilotQueue[device.mac];
+        timers.forEach(clearTimeout);
         wiz.log.debug(
           `[Socket] Failed to send getPilot to ${device.mac}: ${error.toString()}`
         );
-        const { callbacks } = getPilotQueue[device.mac];
         delete getPilotQueue[device.mac];
         callbacks.forEach((f) => f(error, null as any));
       }
@@ -72,7 +105,12 @@ export function getPilot<T>(
   );
 }
 
-const setPilotQueue: { [ip: string]: ((error: Error | null) => void)[] } = {};
+const setPilotQueue: {
+  [ip: string]: {
+    callbacks: ((error: Error | null) => void)[];
+    timeout: NodeJS.Timeout;
+  };
+} = {};
 const setPilotPending: {
   [ip: string]: {
     wiz: HomebridgeWizLan;
@@ -113,14 +151,29 @@ function sendSetPilot(
     env: "pro",
     params: Object.assign({ mac: device.mac, src: "udp" }, pilot),
   });
-  setPilotQueue[device.ip] = callbacks;
+  // Without this deadline a lost ack leaves the queue entry in place forever:
+  // the HomeKit callback never resolves and every later command for this
+  // device parks in setPilotPending without ever being transmitted.
+  const timeout = setTimeout(() => {
+    if (device.ip in setPilotQueue) {
+      const { callbacks: cbs } = setPilotQueue[device.ip];
+      delete setPilotQueue[device.ip];
+      cbs.forEach((f) =>
+        f(new Error(`No setPilot response from ${device.ip} within 2s`))
+      );
+      flushPendingSetPilot(device.ip);
+    }
+  }, SET_PILOT_TIMEOUT);
+  setPilotQueue[device.ip] = { callbacks, timeout };
   wiz.log.debug(`[SetPilot][${device.ip}:${BROADCAST_PORT}] ${msg}`);
   wiz.socket.send(msg, BROADCAST_PORT, device.ip, (error: Error | null) => {
     if (error !== null && device.ip in setPilotQueue) {
       wiz.log.debug(
         `[Socket] Failed to send setPilot to ${device.ip}: ${error.toString()}`
       );
-      const cbs = setPilotQueue[device.ip];
+      const { callbacks: cbs, timeout: pendingTimeout } =
+        setPilotQueue[device.ip];
+      clearTimeout(pendingTimeout);
       delete setPilotQueue[device.ip];
       cbs.forEach((f) => f(error));
       flushPendingSetPilot(device.ip);
@@ -219,15 +272,21 @@ export function registerDiscoveryHandler(
       } else if (response.method === "getPilot") {
         const mac = response.result.mac;
         if (mac in getPilotQueue) {
-          const { callbacks, timeout } = getPilotQueue[mac];
-          clearTimeout(timeout);
+          const { callbacks, timers } = getPilotQueue[mac];
+          timers.forEach(clearTimeout);
           delete getPilotQueue[mac];
           callbacks.forEach((f) => f(null, response.result));
         }
+        // A reply landing after the deadline is dropped deliberately: crediting
+        // it (recordSuccess) would let a device with sustained >1s RTT reset
+        // the failure streak on every probe while its stale reply is discarded
+        // — never marked offline, yet cache-first would serve frozen state
+        // forever. Better that such a device truthfully goes "No Response".
       } else if (response.method === "setPilot") {
         const ip = rinfo.address;
         if (ip in setPilotQueue) {
-          const callbacks = setPilotQueue[ip];
+          const { callbacks, timeout } = setPilotQueue[ip];
+          clearTimeout(timeout);
           delete setPilotQueue[ip];
           callbacks.map((f) =>
             f(response.error ? new Error(response.error.toString()) : null)
