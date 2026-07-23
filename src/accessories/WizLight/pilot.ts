@@ -5,6 +5,7 @@ import { isOffline, recordFailureOnce, recordSuccess } from "../../util/offline"
 import { Device } from "../../types";
 import {
   getPilot as _getPilot,
+  hasInFlightGetPilot,
   setPilot as _setPilot,
 } from "../../util/network";
 import {
@@ -46,6 +47,22 @@ export interface Pilot extends WizPilot {
 // updating, otherwise the bulb resets
 // to default values
 export const cachedPilot: { [mac: string]: Pilot } = {};
+
+// Bumped on every transmitted setPilot. A getPilot probe captures the value
+// when it starts; if a write advanced it before the reply returns, the bulb
+// generated that reply before the write reached it. Committing such a reply
+// would roll cachedPilot — and the HomeKit tile — back to pre-write state
+// (cache-first reads leave probes in flight long enough for a user write to
+// interleave, and its ack can beat the delayed reply).
+export const writeGeneration: { [mac: string]: number } = {};
+
+// writeGeneration snapshot taken when the underlying UDP probe was actually
+// transmitted. The network layer coalesces probes per device, so a getPilot
+// call landing while one is in flight shares that probe's reply and must
+// compare against the transmitting call's snapshot — a write can land between
+// transmission and join, and the shared reply predates it for every callback
+// in the batch.
+const probeStartGeneration: { [mac: string]: number } = {};
 
 export const disabledAdaptiveLightingCallback: {
   [mac: string]: () => void;
@@ -129,6 +146,13 @@ export function getPilot(
     responded = true;
   }
 
+  // Only the call that actually transmits a probe takes a fresh snapshot;
+  // calls that piggyback on an in-flight probe inherit the starter's.
+  if (!hasInFlightGetPilot(device.mac)) {
+    probeStartGeneration[device.mac] = writeGeneration[device.mac] ?? 0;
+  }
+  const generationAtProbeStart = probeStartGeneration[device.mac] ?? 0;
+
   _getPilot<Pilot>(wiz, device, (error, pilot) => {
     if (error !== null) {
       const threshold = Math.max(1, Number(wiz.config.pingFailuresBeforeOffline ?? 3));
@@ -158,10 +182,30 @@ export function getPilot(
       wiz.log.info(`[${device.mac}] Device is back online`);
     }
 
+    if ((writeGeneration[device.mac] ?? 0) !== generationAtProbeStart) {
+      // A write went out while this probe was in flight, so the reply is
+      // stale even though it arrived last. Drop it — the next probe reports
+      // post-write truth — but recordSuccess above still counted the reply
+      // for offline tracking (the device did answer).
+      wiz.log.debug(
+        `[getPilot] Discarding stale reply from ${device.mac}: a write raced ahead of it`
+      );
+      if (!responded) {
+        // HomeKit is still waiting on this GET — answer with the freshest
+        // known state instead of the pre-write reply.
+        onSuccess(cachedPilot[device.mac] ?? pilot);
+      }
+      return;
+    }
+
     const old = cachedPilot[device.mac];
     if (
       typeof old !== "undefined" &&
-      (pilot.sceneId !== 0 ||
+      // Some firmware reports "no scene" as a missing sceneId rather than 0;
+      // treat both the same, like updatePilot's useCT check does — otherwise
+      // every reply from such a bulb reads as an active scene and disables
+      // adaptive lighting on every poll.
+      ((pilot.sceneId ?? 0) !== 0 ||
         pilot.r !== old.r ||
         pilot.g !== old.g ||
         pilot.b !== old.b ||
@@ -222,6 +266,11 @@ export function setPilot(
     ...oldPilot,
     ...newPilot,
   } as Pilot;
+  // Mark in-flight probes stale before the cache commit: their replies
+  // predate this write, and a delayed one landing after the ack must not
+  // clobber the newer state. Not undone on rollback — a timed-out write may
+  // still have reached the bulb, so pre-write replies stay untrustworthy.
+  writeGeneration[device.mac] = (writeGeneration[device.mac] ?? 0) + 1;
   cachedPilot[device.mac] = optimisticPilot;
   const outboundPilot =
     wiz.config.lastStatus && isStateOnlyUpdate ? { state: pilot.state } : newPilot;
@@ -233,6 +282,14 @@ export function setPilot(
     // would leave the cache behind the confirmed device state.
     if (error !== null && cachedPilot[device.mac] === optimisticPilot) {
       cachedPilot[device.mac] = oldPilot;
+    }
+    if (error !== null) {
+      // A timed-out write may still have reached the bulb (lost ack), so
+      // neither the rolled-back snapshot nor the optimistic state is
+      // trustworthy now — probe the device so cache and HomeKit converge on
+      // truth instead of waiting for the next poll. Coalesces with any probe
+      // already in flight.
+      getPilot(wiz, accessory, device, () => {}, () => {});
     }
     callback(error);
   });

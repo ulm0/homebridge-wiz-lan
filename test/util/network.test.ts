@@ -8,6 +8,7 @@ import {
 } from "bun:test";
 import {
   getPilot,
+  hasInFlightGetPilot,
   registerDiscoveryHandler,
   sendDiscoveryBroadcast,
   setPilot,
@@ -62,6 +63,29 @@ describe("network: getPilot in-flight dedup", () => {
       (wiz.socket as FakeSocket).sent.filter((s) => s.msg.includes('"getPilot"'))
         .length,
     ).toBe(1);
+  });
+
+  it("hasInFlightGetPilot tracks the probe lifecycle across coalesced joins", () => {
+    const wiz = makeFakeWiz(baseConfig());
+    registerDiscoveryHandler(wiz, () => {});
+    const device = uniqueDevice();
+    expect(hasInFlightGetPilot(device.mac)).toBe(false);
+    getPilot(wiz, device, () => {});
+    expect(hasInFlightGetPilot(device.mac)).toBe(true);
+    // A piggybacked join keeps the same probe open — no new transmission.
+    getPilot(wiz, device, () => {});
+    expect(hasInFlightGetPilot(device.mac)).toBe(true);
+    wiz.socket.emit(
+      "message",
+      Buffer.from(
+        JSON.stringify({
+          method: "getPilot",
+          result: { mac: device.mac, state: true },
+        }),
+      ),
+      { address: device.ip, port: 38899 },
+    );
+    expect(hasInFlightGetPilot(device.mac)).toBe(false);
   });
 
   it("sends to the device IP on port 38899", () => {
@@ -131,6 +155,103 @@ describe("network: getPilot retransmits", () => {
         .length,
     ).toBe(1);
   }, 5000);
+});
+
+describe("network: duplicate reply absorption", () => {
+  const reply = (wiz: any, device: any, extra: any = {}) =>
+    wiz.socket.emit(
+      "message",
+      Buffer.from(
+        JSON.stringify({
+          method: "getPilot",
+          result: { mac: device.mac, state: false, ...extra },
+        }),
+      ),
+      { address: device.ip, port: 38899 },
+    );
+
+  it("absorbs the duplicate a retransmitted probe can elicit instead of resolving the next probe with it", async () => {
+    const wiz = makeFakeWiz(baseConfig());
+    registerDiscoveryHandler(wiz, () => {});
+    const device = uniqueDevice();
+    const first: any[] = [];
+    getPilot(wiz, device, (_e, p) => first.push(p));
+    // Let the 400ms retransmit fire so two copies of the probe are on the wire.
+    await new Promise((r) => setTimeout(r, 500));
+    reply(wiz, device, { state: false });
+    expect(first.length).toBe(1);
+    // A new probe opens; the bulb's answer to the retransmitted copy lands
+    // first, carrying state read before the previous probe closed.
+    const second: any[] = [];
+    getPilot(wiz, device, (_e, p) => second.push(p));
+    reply(wiz, device, { state: false });
+    // The duplicate must not resolve the new probe...
+    expect(second.length).toBe(0);
+    // ...but the genuine reply does.
+    reply(wiz, device, { state: true });
+    expect(second.length).toBe(1);
+    expect(second[0].state).toBe(true);
+  }, 5000);
+
+  it("does not absorb anything when the probe resolved before retransmitting", () => {
+    const wiz = makeFakeWiz(baseConfig());
+    registerDiscoveryHandler(wiz, () => {});
+    const device = uniqueDevice();
+    const first: any[] = [];
+    getPilot(wiz, device, (_e, p) => first.push(p));
+    // One packet out, one reply back — no duplicate is possible.
+    reply(wiz, device);
+    expect(first.length).toBe(1);
+    const second: any[] = [];
+    getPilot(wiz, device, (_e, p) => second.push(p));
+    reply(wiz, device, { state: true });
+    expect(second.length).toBe(1);
+    expect(second[0].state).toBe(true);
+  });
+
+  it("expires the absorption window so later probes are unaffected", async () => {
+    const wiz = makeFakeWiz(baseConfig());
+    registerDiscoveryHandler(wiz, () => {});
+    const device = uniqueDevice();
+    getPilot(wiz, device, () => {});
+    await new Promise((r) => setTimeout(r, 500)); // retransmit fired
+    reply(wiz, device);
+    // Wait out the 600ms window with no duplicate arriving.
+    await new Promise((r) => setTimeout(r, 700));
+    const second: any[] = [];
+    getPilot(wiz, device, (_e, p) => second.push(p));
+    reply(wiz, device, { state: true });
+    expect(second.length).toBe(1);
+  }, 5000);
+});
+
+describe("network: malformed and error replies", () => {
+  it("ignores error replies without result instead of crashing the handler", () => {
+    const wiz = makeFakeWiz(baseConfig());
+    const added: any[] = [];
+    registerDiscoveryHandler(wiz, (d) => added.push(d));
+    const device = uniqueDevice();
+    const results: any[] = [];
+    getPilot(wiz, device, (e, p) => results.push([e, p]));
+    const emit = (payload: any) =>
+      wiz.socket.emit("message", Buffer.from(JSON.stringify(payload)), {
+        address: device.ip,
+        port: 38899,
+      });
+    // WiZ firmware answers some requests with {error:{...}} and no result —
+    // none of these may throw inside the dgram handler (an uncaught throw
+    // there would crash Homebridge).
+    emit({ method: "getPilot", error: { code: -32700, message: "Parse error" } });
+    emit({ method: "registration", error: { code: -32600 } });
+    emit({ method: "getSystemConfig", error: { code: -32600 } });
+    expect(results.length).toBe(0);
+    expect(added.length).toBe(0);
+    // The probe is still open and a real reply still resolves it.
+    emit({ method: "getPilot", result: { mac: device.mac, state: true } });
+    expect(results.length).toBe(1);
+    expect(results[0][0]).toBeNull();
+    expect(results[0][1].state).toBe(true);
+  });
 });
 
 describe("network: setPilot payload composition", () => {

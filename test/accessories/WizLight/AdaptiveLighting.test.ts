@@ -8,6 +8,7 @@ const getPilotMock = mock(
 mock.module("../../../src/util/network", () => ({
   getPilot: getPilotMock,
   setPilot: mock(() => {}),
+  hasInFlightGetPilot: () => false,
 }));
 
 import { initAdaptiveLighting } from "../../../src/accessories/WizLight/AdaptiveLighting";
