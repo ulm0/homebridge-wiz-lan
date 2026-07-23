@@ -201,7 +201,11 @@ export function getPilot(
     const old = cachedPilot[device.mac];
     if (
       typeof old !== "undefined" &&
-      (pilot.sceneId !== 0 ||
+      // Some firmware reports "no scene" as a missing sceneId rather than 0;
+      // treat both the same, like updatePilot's useCT check does — otherwise
+      // every reply from such a bulb reads as an active scene and disables
+      // adaptive lighting on every poll.
+      ((pilot.sceneId ?? 0) !== 0 ||
         pilot.r !== old.r ||
         pilot.g !== old.g ||
         pilot.b !== old.b ||
@@ -278,6 +282,14 @@ export function setPilot(
     // would leave the cache behind the confirmed device state.
     if (error !== null && cachedPilot[device.mac] === optimisticPilot) {
       cachedPilot[device.mac] = oldPilot;
+    }
+    if (error !== null) {
+      // A timed-out write may still have reached the bulb (lost ack), so
+      // neither the rolled-back snapshot nor the optimistic state is
+      // trustworthy now — probe the device so cache and HomeKit converge on
+      // truth instead of waiting for the next poll. Coalesces with any probe
+      // already in flight.
+      getPilot(wiz, accessory, device, () => {}, () => {});
     }
     callback(error);
   });

@@ -41,12 +41,27 @@ const GET_PILOT_RETRANSMIT_DELAYS = [400];
 // command in flight. 2s keeps that window to genuinely lost acks — merely
 // slow ones (1-2s) still resolve correctly — while a truly lost ack errors
 // the HomeKit callback instead of hanging it and wedging the queue forever.
+// Deliberately NOT closed by dropping the first ack after a timeout: a truly
+// lost ack (the common Wi-Fi case) would make that drop eat the NEXT
+// command's genuine ack, whose own timeout arms another drop — cascading
+// through a whole write burst. The accessory layer re-probes after a failed
+// write instead, so the cache converges on device truth either way.
 const SET_PILOT_TIMEOUT = 2000;
+// A retransmitted probe can be answered twice, and replies carry no request
+// id — after such a probe resolves, the second answer may still arrive and
+// would otherwise resolve a NEWER probe with state read before the earlier
+// probe closed (and before any write since). Absorb one reply for a short
+// window: long enough for the duplicate (the two copies go out 400ms apart),
+// short enough that wrongly absorbing a genuine reply costs at most one
+// probe cycle, which cache-first reads hide.
+const DUPLICATE_REPLY_WINDOW = 600;
+const duplicateReplyDeadlines: { [mac: string]: number[] } = {};
 
 const getPilotQueue: {
   [mac: string]: {
     callbacks: ((error: Error | null, pilot: any) => void)[];
     timers: NodeJS.Timeout[];
+    retransmitted?: boolean;
   };
 } = {};
 export function getPilot<T>(
@@ -76,6 +91,9 @@ export function getPilot<T>(
   const retransmits = GET_PILOT_RETRANSMIT_DELAYS.map((delay) =>
     setTimeout(() => {
       if (device.mac in getPilotQueue) {
+        // Two copies are now on the wire — the reply handler uses this to
+        // absorb a possible second answer after the probe resolves.
+        getPilotQueue[device.mac].retransmitted = true;
         wiz.log.debug(`[getPilot] Retransmitting getPilot to ${device.mac}`);
         // Send errors here are ignored — the deadline timer reports failure
         wiz.socket.send(msg, BROADCAST_PORT, device.ip);
@@ -258,7 +276,14 @@ export function registerDiscoveryHandler(
         return;
       }
       if (response.method === "registration") {
-        const mac = response.result.mac;
+        // WiZ firmware answers some requests with {error:{...}} and no
+        // result; reading result.mac unguarded would throw inside the dgram
+        // handler and crash Homebridge.
+        const mac = response.result?.mac;
+        if (typeof mac !== "string") {
+          log.debug(`[${ip}] Ignoring registration reply without result.mac`);
+          return;
+        }
         // Any registration reply means the bulb just responded on the network,
         // so any prior failure streak is no longer valid.
         recordSuccess(mac);
@@ -270,7 +295,11 @@ export function registerDiscoveryHandler(
           ip
         );
       } else if (response.method === "getSystemConfig") {
-        const mac = response.result.mac;
+        const mac = response.result?.mac;
+        if (typeof mac !== "string") {
+          log.debug(`[${ip}] Ignoring getSystemConfig reply without result.mac`);
+          return;
+        }
         recordSuccess(mac);
         log.debug(`[${ip}@${mac}] Received config`);
         addDevice({
@@ -279,11 +308,33 @@ export function registerDiscoveryHandler(
           model: response.result.moduleName,
         });
       } else if (response.method === "getPilot") {
-        const mac = response.result.mac;
+        const mac = response.result?.mac;
+        if (typeof mac !== "string") {
+          // Error reply — the open probe (if any) falls through to its
+          // deadline instead of crashing the handler.
+          log.debug(`[${ip}] Ignoring getPilot reply without result.mac`);
+          return;
+        }
+        const owed = (duplicateReplyDeadlines[mac] ?? []).filter(
+          (deadline) => deadline > Date.now()
+        );
+        if (owed.length > 0) {
+          // A retransmitted probe already got its answer; this is most likely
+          // the bulb answering the second copy, carrying state older than the
+          // probe currently open (and older than any write since).
+          owed.shift();
+          duplicateReplyDeadlines[mac] = owed;
+          log.debug(`[getPilot] Absorbing probable duplicate reply from ${mac}`);
+          return;
+        }
+        delete duplicateReplyDeadlines[mac];
         if (mac in getPilotQueue) {
-          const { callbacks, timers } = getPilotQueue[mac];
+          const { callbacks, timers, retransmitted } = getPilotQueue[mac];
           timers.forEach(clearTimeout);
           delete getPilotQueue[mac];
+          if (retransmitted) {
+            duplicateReplyDeadlines[mac] = [Date.now() + DUPLICATE_REPLY_WINDOW];
+          }
           callbacks.forEach((f) => f(null, response.result));
         }
         // A reply landing after the deadline is dropped deliberately: crediting

@@ -356,6 +356,37 @@ describe("WizSocket/pilot: stale probe replies vs. interleaved writes", () => {
   });
 });
 
+describe("WizSocket/pilot: failed-write resync", () => {
+  it("probes the device after a failed write so the cache converges on truth", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP10_SOCKET_06" });
+    cachedPilot[TEST_MAC] = makeSocketPilot({ mac: TEST_MAC, state: false });
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    expect(pendingGet.length).toBe(0);
+    pendingSet[0](new Error("ack timeout"));
+    // Cache rolled back...
+    expect(cachedPilot[TEST_MAC].state).toBe(false);
+    // ...and a resync probe went out. The lost-ack write actually applied:
+    expect(pendingGet.length).toBe(1);
+    pendingGet[0](null, makeSocketPilot({ mac: TEST_MAC, state: true }));
+    expect(cachedPilot[TEST_MAC].state).toBe(true);
+    const svc = accessory.getService(wiz.Service.Outlet)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
+      .toHaveBeenCalled();
+  });
+
+  it("does not probe after a successful write", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP10_SOCKET_06" });
+    cachedPilot[TEST_MAC] = makeSocketPilot({ mac: TEST_MAC, state: false });
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    expect(pendingGet.length).toBe(0);
+  });
+});
+
 describe("WizSocket/pilot: setPilot", () => {
   it("calls callback with an error when there is no cached state", () => {
     const wiz = makeFakeWiz();

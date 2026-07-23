@@ -676,6 +676,83 @@ describe("WizLight/pilot: stale probe replies vs. interleaved writes", () => {
   });
 });
 
+describe("WizLight/pilot: failed-write resync", () => {
+  const device = makeDevice({ mac: TEST_MAC, model: "ESP01_SHRGB_03" });
+
+  it("probes the device after a failed write so the cache converges on truth", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      state: false,
+      dimming: 20,
+    });
+    setPilot(wiz, accessory as any, device, { dimming: 80 }, () => {});
+    expect(pendingGet.length).toBe(0);
+    pendingSet[0](new Error("ack timeout"));
+    // Cache rolled back...
+    expect(cachedPilot[TEST_MAC].dimming).toBe(20);
+    // ...and a resync probe went out. The lost-ack write actually applied:
+    expect(pendingGet.length).toBe(1);
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, state: false, dimming: 80 }));
+    expect(cachedPilot[TEST_MAC].dimming).toBe(80);
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.Brightness).updateValue)
+      .toHaveBeenCalled();
+  });
+
+  it("does not probe after a successful write", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({ mac: TEST_MAC, state: false });
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    pendingSet[0](null);
+    expect(pendingGet.length).toBe(0);
+  });
+});
+
+describe("WizLight/pilot: sceneId normalization", () => {
+  const device = makeDevice({ mac: TEST_MAC, model: "ESP01_SHRGB_03" });
+
+  it("a reply that omits sceneId with unchanged colors does not disable adaptive lighting", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      r: 10,
+      g: 10,
+      b: 10,
+    });
+    let adaptiveDisabled = false;
+    disabledAdaptiveLightingCallback[TEST_MAC] = () => {
+      adaptiveDisabled = true;
+    };
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    // Firmware that reports "no scene" as a missing sceneId (not 0) must be
+    // treated like sceneId 0, matching updatePilot's useCT check.
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, r: 10, g: 10, b: 10 }));
+    expect(adaptiveDisabled).toBe(false);
+  });
+
+  it("still disables adaptive lighting when a sceneId-less reply shows a real color change", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    cachedPilot[TEST_MAC] = makeLightPilot({
+      mac: TEST_MAC,
+      r: 10,
+      g: 10,
+      b: 10,
+    });
+    let adaptiveDisabled = false;
+    disabledAdaptiveLightingCallback[TEST_MAC] = () => {
+      adaptiveDisabled = true;
+    };
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC, r: 200, g: 0, b: 0 }));
+    expect(adaptiveDisabled).toBe(true);
+  });
+});
+
 describe("WizLight/pilot: updateColorTemp", () => {
   it("for RGB devices, updates hue/saturation/temperature characteristics on success", () => {
     const wiz = makeFakeWiz();

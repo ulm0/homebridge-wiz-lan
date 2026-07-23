@@ -145,7 +145,7 @@ export function getPilot(
 
 export function setPilot(
   wiz: HomebridgeWizLan,
-  _: PlatformAccessory,
+  accessory: PlatformAccessory,
   device: Device,
   pilot: Partial<Pilot>,
   callback: (error: Error | null) => void
@@ -184,6 +184,14 @@ export function setPilot(
     // would leave the cache behind the confirmed device state.
     if (error !== null && cachedPilot[device.mac] === optimisticPilot) {
       cachedPilot[device.mac] = oldPilot;
+    }
+    if (error !== null) {
+      // A timed-out write may still have reached the device (lost ack), so
+      // neither the rolled-back snapshot nor the optimistic state is
+      // trustworthy now — probe the device so cache and HomeKit converge on
+      // truth instead of waiting for the next poll. Coalesces with any probe
+      // already in flight.
+      getPilot(wiz, accessory, device, () => {}, () => {});
     }
     callback(error);
   });
