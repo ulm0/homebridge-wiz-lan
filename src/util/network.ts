@@ -7,7 +7,7 @@ import { Pilot as SocketPilot } from "../accessories/WizSocket/pilot";
 import { Device } from "../types";
 import HomebridgeWizLan from "../wiz";
 import { makeLogger } from "./logger";
-import { recordSuccess } from "./offline";
+import { isOffline, recordSuccess } from "./offline";
 
 function strMac() {
   return getMac().toUpperCase().replace(/:/g, "");
@@ -35,6 +35,11 @@ const GET_PILOT_TIMEOUT = 1000;
 // Single retransmit only — every extra copy makes the bulb answer the same
 // probe twice, and replies carry no request id, so a duplicate landing while
 // a *later* probe is open would resolve it with stale state.
+//
+// Only armed for probes HomeKit is actually waiting on (see the `retransmit`
+// option). With a warm cache the GET has already been answered, so a second
+// copy buys nothing visible and just doubles the packets aimed at a device
+// that is, by definition, not answering promptly.
 const GET_PILOT_RETRANSMIT_DELAYS = [400];
 // setPilot acks also carry no request id (matched by source IP only), so a
 // timed-out command whose ack arrives late can be misattributed to the next
@@ -57,25 +62,178 @@ const SET_PILOT_TIMEOUT = 2000;
 const DUPLICATE_REPLY_WINDOW = 600;
 const duplicateReplyDeadlines: { [mac: string]: number[] } = {};
 
+// ---------------------------------------------------------------------------
+// Outbound rate limiting
+//
+// Every transmit path here is driven by an event source this plugin does not
+// control — HomeKit characteristic reads, HomeKit writes, reply handlers — and
+// until now none of them was rate limited. One UDP packet went out per
+// characteristic GET, and 3.4.0's cache-first reads removed the last
+// accidental brake: a GET used to block on the UDP round trip, which paced the
+// controller at roughly one probe per RTT. Answering instantly from cache lets
+// a controller start a fresh probe the moment the previous one closes, so the
+// probe rate became bounded only by how fast HomeKit chose to read. With
+// several accessories open — or a row of tiles showing "No Response", which
+// controllers retry hard — that is enough to saturate a LAN, and the resulting
+// congestion drops more replies, marks more devices offline and drives still
+// more retries.
+//
+// These floors cap what any caller can put on the wire per device. Callers are
+// never dropped: a throttled probe is deferred to the end of the window and
+// every caller that arrives meanwhile coalesces onto it, so state still
+// converges — just at a rate the network can carry.
+const GET_PILOT_MIN_INTERVAL = 1000;
+// An unreachable device answers nothing, so probing it on every read is pure
+// noise; HomeKit is already being served "No Response" without waiting. Back
+// off hard and let the refresh sweep (or this ceiling) find it again.
+const OFFLINE_GET_PILOT_MIN_INTERVAL = 30_000;
+// Discovery is the only true LAN-wide broadcast this plugin emits — every host
+// on the subnet takes an interrupt for it, not just the bulbs. Floor it
+// independently of whatever discoveryInterval is configured.
+const DISCOVERY_MIN_INTERVAL = 5000;
+/** Same floor, in the seconds unit `discoveryInterval` is configured in. */
+export const MIN_DISCOVERY_INTERVAL_SECONDS = DISCOVERY_MIN_INTERVAL / 1000;
+
+/**
+ * When to stop absorbing duplicates for this device.
+ *
+ * Never past the moment the rate limiter would let a new probe transmit: that
+ * probe's own genuine reply arrives just after it, and absorbing that is
+ * strictly worse than letting a late duplicate through. Before the limiter
+ * existed the next probe could open at any time, so the fixed window was as
+ * good a guess as any; now the earliest it can open is known exactly.
+ */
+function duplicateAbsorbDeadline(wiz: HomebridgeWizLan, mac: string): number {
+  const nextProbeEarliest =
+    (lastProbeTransmit[mac] ?? -Infinity) + probeMinInterval(wiz, mac);
+  return Math.min(Date.now() + DUPLICATE_REPLY_WINDOW, nextProbeEarliest);
+}
+
+type ProbeCallback = (error: Error | null, pilot: any) => void;
+
+export interface GetPilotOptions {
+  /**
+   * Arm the retransmit for this probe. Pass true only when the caller has no
+   * cached state to fall back on, i.e. when HomeKit is genuinely blocked on
+   * the reply — otherwise the extra copy is invisible and only adds load.
+   */
+  retransmit?: boolean;
+  /**
+   * Invoked synchronously immediately before the probe is put on the wire.
+   * Probes can be deferred by the rate limiter, so callers that need to
+   * snapshot state "as of transmission" (see writeGeneration in the accessory
+   * layer) must do it here rather than when they call getPilot.
+   */
+  onTransmit?: () => void;
+}
+
 const getPilotQueue: {
   [mac: string]: {
-    callbacks: ((error: Error | null, pilot: any) => void)[];
+    callbacks: ProbeCallback[];
     timers: NodeJS.Timeout[];
     retransmitted?: boolean;
   };
 } = {};
+
+// Wall-clock of the last probe actually transmitted per device, and the probes
+// currently waiting out the rate limiter.
+const lastProbeTransmit: { [mac: string]: number } = {};
+const deferredProbes: {
+  [mac: string]: {
+    callbacks: ProbeCallback[];
+    retransmit: boolean;
+    onTransmit?: () => void;
+    timer: NodeJS.Timeout;
+  };
+} = {};
+
+/** Minimum gap between transmitted probes for this device. */
+function probeMinInterval(wiz: HomebridgeWizLan, mac: string): number {
+  if (!isOffline(mac)) {
+    return GET_PILOT_MIN_INTERVAL;
+  }
+  // Honour a refreshInterval shorter than the offline ceiling — the user asked
+  // for that cadence, and it is bounded and self-paced, unlike per-read probing.
+  const refresh = Number(wiz.config.refreshInterval ?? 0) * 1000;
+  const backoff =
+    refresh > 0
+      ? Math.min(OFFLINE_GET_PILOT_MIN_INTERVAL, refresh)
+      : OFFLINE_GET_PILOT_MIN_INTERVAL;
+  return Math.max(GET_PILOT_MIN_INTERVAL, backoff);
+}
+
 export function getPilot<T>(
   wiz: HomebridgeWizLan,
   device: Device,
-  callback: (error: Error | null, pilot: T) => void
+  callback: (error: Error | null, pilot: T) => void,
+  options: GetPilotOptions = {}
 ) {
   if (device.mac in getPilotQueue) {
     // Piggyback on the already in-flight request — no extra UDP packet sent
     getPilotQueue[device.mac].callbacks.push(callback);
     return;
   }
+
+  if (device.mac in deferredProbes) {
+    // A probe is already waiting out the rate limiter — join it rather than
+    // arming a second one. It transmits with the union of the joiners' needs.
+    const deferred = deferredProbes[device.mac];
+    deferred.callbacks.push(callback);
+    deferred.retransmit = deferred.retransmit || options.retransmit === true;
+    deferred.onTransmit = deferred.onTransmit ?? options.onTransmit;
+    return;
+  }
+
+  const minInterval = probeMinInterval(wiz, device.mac);
+  const sinceLast = Date.now() - (lastProbeTransmit[device.mac] ?? -Infinity);
+  if (sinceLast < minInterval) {
+    const wait = minInterval - sinceLast;
+    wiz.log.debug(
+      `[getPilot] Throttling probe to ${device.mac}, transmitting in ${wait}ms`
+    );
+    const timer = setTimeout(() => {
+      const deferred = deferredProbes[device.mac];
+      if (typeof deferred === "undefined") {
+        return;
+      }
+      delete deferredProbes[device.mac];
+      transmitGetPilot(
+        wiz,
+        device,
+        deferred.callbacks,
+        deferred.retransmit,
+        deferred.onTransmit
+      );
+    }, wait);
+    // A throttled probe must not keep the Node process alive on shutdown.
+    timer.unref?.();
+    deferredProbes[device.mac] = {
+      callbacks: [callback],
+      retransmit: options.retransmit === true,
+      onTransmit: options.onTransmit,
+      timer,
+    };
+    return;
+  }
+
+  transmitGetPilot(
+    wiz,
+    device,
+    [callback],
+    options.retransmit === true,
+    options.onTransmit
+  );
+}
+
+function transmitGetPilot(
+  wiz: HomebridgeWizLan,
+  device: Device,
+  callbacks: ProbeCallback[],
+  retransmit: boolean,
+  onTransmit?: () => void
+) {
   const msg = `{"method":"getPilot","params":{}}`;
-  // No in-flight request for this device — fire immediately
+  lastProbeTransmit[device.mac] = Date.now();
   const deadline = setTimeout(() => {
     if (device.mac in getPilotQueue) {
       const { callbacks, timers } = getPilotQueue[device.mac];
@@ -88,22 +246,26 @@ export function getPilot<T>(
       callbacks.forEach((f) => f(error, null as any));
     }
   }, GET_PILOT_TIMEOUT);
-  const retransmits = GET_PILOT_RETRANSMIT_DELAYS.map((delay) =>
-    setTimeout(() => {
-      if (device.mac in getPilotQueue) {
-        // Two copies are now on the wire — the reply handler uses this to
-        // absorb a possible second answer after the probe resolves.
-        getPilotQueue[device.mac].retransmitted = true;
-        wiz.log.debug(`[getPilot] Retransmitting getPilot to ${device.mac}`);
-        // Send errors here are ignored — the deadline timer reports failure
-        wiz.socket.send(msg, BROADCAST_PORT, device.ip);
-      }
-    }, delay)
+  const retransmits = (retransmit ? GET_PILOT_RETRANSMIT_DELAYS : []).map(
+    (delay) =>
+      setTimeout(() => {
+        if (device.mac in getPilotQueue) {
+          // Two copies are now on the wire — the reply handler uses this to
+          // absorb a possible second answer after the probe resolves.
+          getPilotQueue[device.mac].retransmitted = true;
+          wiz.log.debug(`[getPilot] Retransmitting getPilot to ${device.mac}`);
+          // Send errors here are ignored — the deadline timer reports failure
+          wiz.socket.send(msg, BROADCAST_PORT, device.ip);
+        }
+      }, delay)
   );
   getPilotQueue[device.mac] = {
-    callbacks: [callback],
+    callbacks,
     timers: [deadline, ...retransmits],
   };
+  // Before the send, so callers snapshotting "state as of transmission" see a
+  // consistent view even though the rate limiter may have deferred us here.
+  onTransmit?.();
   wiz.log.debug(`[getPilot] Sending getPilot to ${device.mac}`);
   wiz.socket.send(
     msg,
@@ -123,13 +285,13 @@ export function getPilot<T>(
   );
 }
 
-// The accessory layer snapshots its per-device write generation when a probe
-// is transmitted. Coalesced callers share the in-flight probe's reply — state
-// the bulb read before any write sent since transmission — so they must
-// inherit the transmitting call's snapshot instead of taking their own. This
-// tells them which case they are in.
+/**
+ * True when a probe for this device already exists — either on the wire or
+ * deferred by the rate limiter — so a getPilot call would coalesce onto it
+ * rather than transmit a new packet.
+ */
 export function hasInFlightGetPilot(mac: string): boolean {
-  return mac in getPilotQueue;
+  return mac in getPilotQueue || mac in deferredProbes;
 }
 
 const setPilotQueue: {
@@ -234,6 +396,13 @@ export function createSocket(wiz: HomebridgeWizLan) {
 
   wiz.api.on("shutdown", () => {
     log.debug("Shutting down socket");
+    // A throttled probe can sit for as long as the offline backoff before it
+    // transmits. Drop those first: firing one after close() would try to send
+    // on a dead socket.
+    for (const mac of Object.keys(deferredProbes)) {
+      clearTimeout(deferredProbes[mac].timer);
+      delete deferredProbes[mac];
+    }
     socket.close();
   });
 
@@ -333,7 +502,7 @@ export function registerDiscoveryHandler(
           timers.forEach(clearTimeout);
           delete getPilotQueue[mac];
           if (retransmitted) {
-            duplicateReplyDeadlines[mac] = [Date.now() + DUPLICATE_REPLY_WINDOW];
+            duplicateReplyDeadlines[mac] = [duplicateAbsorbDeadline(wiz, mac)];
           }
           callbacks.forEach((f) => f(null, response.result));
         }
@@ -360,10 +529,25 @@ export function registerDiscoveryHandler(
   }
 }
 
+let lastDiscoveryBroadcast = -Infinity;
+
 export function sendDiscoveryBroadcast(service: HomebridgeWizLan) {
   const { ADDRESS, MAC, BROADCAST } = getNetworkConfig(service);
 
   const log = makeLogger(service, "Discovery");
+
+  const sinceLast = Date.now() - lastDiscoveryBroadcast;
+  if (sinceLast < DISCOVERY_MIN_INTERVAL) {
+    // Unlike a unicast probe there is nothing to defer onto — the next tick
+    // will re-broadcast anyway, and skipping one costs only latency in
+    // noticing a device that appeared in the last few seconds.
+    log.debug(
+      `Skipping discovery broadcast: last one was ${sinceLast}ms ago ` +
+        `(minimum ${DISCOVERY_MIN_INTERVAL}ms)`
+    );
+    return;
+  }
+  lastDiscoveryBroadcast = Date.now();
   // Debug-level because this now fires every `refreshInterval` tick as well
   // as on startup; at info it flooded the log with one line per listed
   // device per tick. Same rationale as the refresh-ping log downgrade
@@ -389,5 +573,21 @@ export function sendDiscoveryBroadcast(service: HomebridgeWizLan) {
         );
       }
     }
+  }
+}
+
+/**
+ * Clears the rate limiter's memory of what was sent when. Exists for tests:
+ * the throttles are keyed on wall-clock time in module scope, so without this
+ * one test's transmissions would silence the next one's.
+ */
+export function resetRateLimitsForTesting() {
+  lastDiscoveryBroadcast = -Infinity;
+  for (const mac of Object.keys(lastProbeTransmit)) {
+    delete lastProbeTransmit[mac];
+  }
+  for (const mac of Object.keys(deferredProbes)) {
+    clearTimeout(deferredProbes[mac].timer);
+    delete deferredProbes[mac];
   }
 }

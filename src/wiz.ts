@@ -10,7 +10,14 @@ import {
 import Accessories, { WizAccessory } from './accessories';
 import { PLATFORM_NAME, PLUGIN_NAME } from "./constants";
 import { Config, Device } from "./types";
-import { bindSocket, createSocket, registerDiscoveryHandler, sendDiscoveryBroadcast } from "./util/network";
+import { bindSocket, createSocket, MIN_DISCOVERY_INTERVAL_SECONDS, registerDiscoveryHandler, sendDiscoveryBroadcast } from "./util/network";
+
+// The refresh sweep used to emit one probe per device in a single synchronous
+// tick. A burst like that is what a flood looks like on the wire, and the
+// correlated packet loss it causes is exactly what makes bulbs miss their
+// deadline and flap to "No Response". Spread the sweep instead, up to this
+// much spacing between devices (the whole sweep still fits in one interval).
+const REFRESH_STAGGER_MAX_MS = 100;
 
 export default class HomebridgeWizLan {
   public readonly Service: typeof Service;
@@ -102,11 +109,22 @@ export default class HomebridgeWizLan {
         );
       }
     } else {
-      this.log.info(`[Discovery] Re-broadcasting every ${interval} seconds`);
+      // Discovery is a subnet-wide broadcast — every host on the LAN takes an
+      // interrupt for it, not just the bulbs. Floor the configured interval so
+      // a typo can't turn re-discovery into a broadcast storm.
+      let effective = interval;
+      if (effective < MIN_DISCOVERY_INTERVAL_SECONDS) {
+        this.log.warn(
+          `[Discovery] discoveryInterval of ${interval}s is below the ${MIN_DISCOVERY_INTERVAL_SECONDS}s minimum ` +
+          `(discovery is a LAN-wide broadcast) — using ${MIN_DISCOVERY_INTERVAL_SECONDS}s`
+        );
+        effective = MIN_DISCOVERY_INTERVAL_SECONDS;
+      }
+      this.log.info(`[Discovery] Re-broadcasting every ${effective} seconds`);
       const timer = setInterval(() => {
         this.log.debug("[Discovery] Sending periodic discovery broadcast...");
         sendDiscoveryBroadcast(this);
-      }, interval * 1000);
+      }, effective * 1000);
       this.api.on("shutdown", () => clearInterval(timer));
     }
   }
@@ -117,18 +135,37 @@ export default class HomebridgeWizLan {
       this.log.info("[Refresh] Pings are off");
     } else {
       this.log.info(`[Refresh] Setting up ping for every ${interval} seconds`);
+      let staggered: NodeJS.Timeout[] = [];
       const timer = setInterval(() => {
         const accessories = Object.values(this.initializedAccessories);
         this.log.debug(`[Refresh] Pinging ${accessories.length} accessories...`);
-        for (const accessory of accessories) {
-          accessory.getPilot().catch((error) => {
-            // HapStatusError means the device was already logged as offline — skip redundant warn
-            if (typeof (error as any).hapStatus === "number") return;
-            this.log.warn(error);
-          });
-        }
+        // A sweep that overruns its interval would otherwise pile up on the
+        // next one; drop whatever is still queued from last time.
+        staggered.forEach(clearTimeout);
+        staggered = [];
+        const spacing = Math.min(
+          REFRESH_STAGGER_MAX_MS,
+          (interval * 1000) / Math.max(accessories.length, 1)
+        );
+        accessories.forEach((accessory, index) => {
+          const ping = () => {
+            accessory.getPilot().catch((error) => {
+              // HapStatusError means the device was already logged as offline — skip redundant warn
+              if (typeof (error as any).hapStatus === "number") return;
+              this.log.warn(error);
+            });
+          };
+          if (index === 0) {
+            ping();
+            return;
+          }
+          staggered.push(setTimeout(ping, Math.round(index * spacing)));
+        });
       }, interval * 1000);
-      this.api.on("shutdown", () => clearInterval(timer));
+      this.api.on("shutdown", () => {
+        clearInterval(timer);
+        staggered.forEach(clearTimeout);
+      });
     }
   }
 

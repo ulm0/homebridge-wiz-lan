@@ -5,7 +5,6 @@ import { isOffline, recordFailureOnce, recordSuccess } from "../../util/offline"
 import { Device } from "../../types";
 import {
   getPilot as _getPilot,
-  hasInFlightGetPilot,
   setPilot as _setPilot,
 } from "../../util/network";
 import {
@@ -35,25 +34,32 @@ export const cachedPilot: { [mac: string]: Pilot } = {};
 export const writeGeneration: { [mac: string]: number } = {};
 
 // writeGeneration snapshot taken when the underlying UDP probe was actually
-// transmitted. The network layer coalesces probes per device, so a getPilot
-// call landing while one is in flight shares that probe's reply and must
-// compare against the transmitting call's snapshot — a write can land between
-// transmission and join, and the shared reply predates it for every callback
-// in the batch.
+// transmitted (via the network layer's onTransmit hook). Probes are coalesced
+// per device and may be deferred by the rate limiter, so a getPilot call can
+// be answered by a probe transmitted well after the call was made. Every
+// callback in that batch shares one reply and must compare against the
+// transmitting probe's snapshot, not one taken when they happened to call.
 const probeStartGeneration: { [mac: string]: number } = {};
 
+// Re-publishing a value HomeKit already holds still emits an event
+// notification, and controllers answer notifications by reading — which starts
+// another probe, which pushes again. Only publish real changes. `force` covers
+// clearing a "No Response" error state, which value equality can't detect.
 function updatePilot(
   wiz: HomebridgeWizLan,
   accessory: PlatformAccessory,
   _: Device,
-  pilot: Pilot | Error
+  pilot: Pilot | Error,
+  force = false
 ) {
   const { Service } = wiz;
   const service = accessory.getService(Service.Outlet)!;
 
-  service
-    .getCharacteristic(wiz.Characteristic.On)
-    .updateValue(pilot instanceof Error ? pilot : transformOnOff(pilot));
+  const characteristic = service.getCharacteristic(wiz.Characteristic.On);
+  const value = pilot instanceof Error ? pilot : transformOnOff(pilot);
+  if (force || pilot instanceof Error || characteristic.value !== value) {
+    characteristic.updateValue(value);
+  }
 }
 
 // Write a custom getPilot/setPilot that takes this
@@ -82,14 +88,13 @@ export function getPilot(
     responded = true;
   }
 
-  // Only the call that actually transmits a probe takes a fresh snapshot;
-  // calls that piggyback on an in-flight probe inherit the starter's.
-  if (!hasInFlightGetPilot(device.mac)) {
-    probeStartGeneration[device.mac] = writeGeneration[device.mac] ?? 0;
-  }
-  const generationAtProbeStart = probeStartGeneration[device.mac] ?? 0;
-
-  _getPilot<Pilot>(wiz, device, (error, pilot) => {
+  const handleReply = (error: Error | null, pilot: Pilot) => {
+    // Read at reply time, not call time: the network layer may have deferred
+    // and coalesced this call onto a probe transmitted later, and every
+    // callback in that batch shares the transmitting probe's snapshot. Safe to
+    // read from the map because a probe's callbacks all run synchronously
+    // before any later probe for the same device can transmit.
+    const generationAtProbeStart = probeStartGeneration[device.mac] ?? 0;
     if (error !== null) {
       const threshold = Math.max(1, Number(wiz.config.pingFailuresBeforeOffline ?? 3));
       const newlyOffline = recordFailureOnce(error, device.mac, threshold);
@@ -135,11 +140,24 @@ export function getPilot(
     cachedPilot[device.mac] = pilot;
     if (responded) {
       // HomeKit was answered from cache (or shown "No Response") — push the
-      // fresh state so the tile converges on reality
-      updatePilot(wiz, accessory, device, pilot);
+      // fresh state so the tile converges on reality. Only changed values go
+      // out, except when the device just came back: HomeKit is holding an
+      // error state that a value-equality check can't see.
+      updatePilot(wiz, accessory, device, pilot, cameBack);
     } else {
       onSuccess(pilot);
     }
+  };
+
+  _getPilot<Pilot>(wiz, device, handleReply, {
+    // Only retransmit when HomeKit is actually blocked on this reply. If the
+    // GET was already answered from cache (or with "No Response"), the second
+    // copy is invisible to the user and only doubles the load on a device that
+    // is already slow to answer.
+    retransmit: !responded,
+    onTransmit: () => {
+      probeStartGeneration[device.mac] = writeGeneration[device.mac] ?? 0;
+    },
   });
 }
 
