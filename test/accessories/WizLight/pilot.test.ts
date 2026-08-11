@@ -13,12 +13,24 @@ const pendingSet: ((e: Error | null) => void)[] = [];
 // Mirror the real layer's per-mac coalescing: the first unresolved call for a
 // mac transmits the probe and later calls piggyback on it. Firing the
 // transmitting call's callback closes the probe, like the real reply handler
-// deleting the queue entry before running the batch.
+// deleting the queue entry before running the batch. The transmitting call
+// also runs `onTransmit`, which is how the accessory layer snapshots state as
+// of the moment the packet goes on the wire.
 const openGetProbes = new Set<string>();
+const getPilotOptions: any[] = [];
 const getPilotMock = mock(
-  (_w: any, d: any, cb: (e: Error | null, p: any) => void) => {
+  (
+    _w: any,
+    d: any,
+    cb: (e: Error | null, p: any) => void,
+    options?: { retransmit?: boolean; onTransmit?: () => void },
+  ) => {
+    getPilotOptions.push(options);
     const startedProbe = !openGetProbes.has(d.mac);
-    if (startedProbe) openGetProbes.add(d.mac);
+    if (startedProbe) {
+      openGetProbes.add(d.mac);
+      options?.onTransmit?.();
+    }
     let fired = false;
     pendingGet.push((e, p) => {
       if (!fired) {
@@ -68,6 +80,7 @@ beforeEach(() => {
   pendingGet.length = 0;
   pendingSet.length = 0;
   openGetProbes.clear();
+  getPilotOptions.length = 0;
   getPilotMock.mockClear();
   setPilotMock.mockClear();
   // clear offline state for any MAC a test might use
@@ -394,6 +407,103 @@ describe("WizLight/pilot: cache-first responses", () => {
     pendingGet[0](new Error("timeout"), null);
     expect(isOffline(mac)).toBe(true);
     expect(err.hapStatus).toBeDefined();
+  });
+});
+
+// Regression guard for the UDP flood: 3.4.0 made every cache-answered read
+// re-publish the probe result to HAP. Republishing a value HomeKit already
+// holds still emits an event notification, controllers answer notifications by
+// reading, and every read starts another probe — a feedback loop with a UDP
+// packet in it. Only genuine changes may be published.
+describe("WizLight/pilot: characteristic updates are change-driven", () => {
+  const poll = (wiz: any, accessory: any, device: any, pilot: any) => {
+    getPilot(wiz, accessory, device, () => {}, () => {});
+    pendingGet[pendingGet.length - 1](null, pilot);
+  };
+
+  it("does not re-publish characteristics when the reply matches what HomeKit holds", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP01_SHRGB_03" });
+    cachedPilot[TEST_MAC] = makeLightPilot({ mac: TEST_MAC, state: true, dimming: 50 });
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    const on = svc.getCharacteristic(wiz.Characteristic.On);
+    const brightness = svc.getCharacteristic(wiz.Characteristic.Brightness);
+
+    const steady = () => makeLightPilot({ mac: TEST_MAC, state: true, dimming: 50 });
+    // First poll publishes — HomeKit holds nothing yet.
+    poll(wiz, accessory, device, steady());
+    expect(on.updateValue).toHaveBeenCalledTimes(1);
+    const brightnessPushes = (brightness.updateValue as any).mock.calls.length;
+
+    // Four more polls, same state each time: nothing further goes to HAP.
+    for (let i = 0; i < 4; i++) poll(wiz, accessory, device, steady());
+    expect(on.updateValue).toHaveBeenCalledTimes(1);
+    expect((brightness.updateValue as any).mock.calls.length).toBe(brightnessPushes);
+  });
+
+  it("still publishes when the state actually changes", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP01_SHRGB_03" });
+    cachedPilot[TEST_MAC] = makeLightPilot({ mac: TEST_MAC, state: true, dimming: 50 });
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    const on = svc.getCharacteristic(wiz.Characteristic.On);
+
+    poll(wiz, accessory, device, makeLightPilot({ mac: TEST_MAC, state: true, dimming: 50 }));
+    poll(wiz, accessory, device, makeLightPilot({ mac: TEST_MAC, state: false, dimming: 50 }));
+    expect(on.updateValue).toHaveBeenCalledTimes(2);
+    expect(on.value).toBe(0);
+  });
+
+  it("force-publishes when a device comes back, since HomeKit is holding an error", () => {
+    const mac = `${TEST_MAC}_BACK`;
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac, model: "ESP01_SHRGB_03" });
+    const svc = accessory.getService(wiz.Service.Lightbulb)!;
+    const on = svc.getCharacteristic(wiz.Characteristic.On);
+
+    // Establish the value HomeKit holds, then knock the device offline.
+    cachedPilot[mac] = makeLightPilot({ mac, state: true, dimming: 50 });
+    poll(wiz, accessory, device, makeLightPilot({ mac, state: true, dimming: 50 }));
+    const before = (on.updateValue as any).mock.calls.length;
+    recordFailure(mac, 1);
+
+    // It recovers reporting exactly the value HomeKit already has. Equality
+    // says "no change", but the tile is showing "No Response" — publish anyway.
+    poll(wiz, accessory, device, makeLightPilot({ mac, state: true, dimming: 50 }));
+    expect((on.updateValue as any).mock.calls.length).toBeGreaterThan(before);
+    _recordSuccess(mac);
+  });
+});
+
+describe("WizLight/pilot: probe retransmit is opt-in", () => {
+  it("asks for a retransmit only when HomeKit is blocked on the reply", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac: TEST_MAC });
+
+    // No cache: HomeKit is waiting, so the extra copy is worth its cost.
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    expect(getPilotOptions[0].retransmit).toBe(true);
+
+    // Cache warm: the GET was already answered, so a second copy buys nothing
+    // visible and only doubles the load on a device that is answering slowly.
+    pendingGet[0](null, makeLightPilot({ mac: TEST_MAC }));
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    expect(getPilotOptions[1].retransmit).toBe(false);
+  });
+
+  it("does not retransmit at a device already known to be offline", () => {
+    const mac = `${TEST_MAC}_OFF2`;
+    const wiz = makeFakeWiz();
+    const accessory = makeAccessoryWithService("Lightbulb");
+    const device = makeDevice({ mac });
+    recordFailure(mac, 1);
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    expect(getPilotOptions[0].retransmit).toBe(false);
+    _recordSuccess(mac);
   });
 });
 

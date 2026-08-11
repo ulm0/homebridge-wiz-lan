@@ -12,6 +12,10 @@ import { makeFakeAPI, makeFakeLogger } from "./__mocks__/homebridge";
 // a real UDP socket. The real util/network functions then operate on our
 // FakeSocket — keeping the surface untouched for other test files.
 const sharedSocket = new FakeSocket();
+// Every platform instance attaches its own error/message listeners to this one
+// shared socket, so the default limit of 10 trips a spurious warning once the
+// file has more than a handful of tests.
+sharedSocket.setMaxListeners(0);
 mock.module("dgram", () => ({
   default: { createSocket: () => sharedSocket as any },
   createSocket: () => sharedSocket as any,
@@ -63,6 +67,32 @@ describe("HomebridgeWizLan.initDiscoveryInterval", () => {
       .map((c: any[]) => String(c[0]))
       .find((m: string) => m.includes("Periodic re-discovery is off"));
     expect(offMsg).toBeDefined();
+  });
+});
+
+describe("HomebridgeWizLan.initDiscoveryInterval: broadcast floor", () => {
+  it("clamps a discoveryInterval below the minimum and says so", () => {
+    // Discovery is a subnet-wide broadcast; every host takes an interrupt for
+    // it, so a typo here must not become a broadcast storm.
+    const { api, log } = makePlatform({ discoveryInterval: 1 });
+    api.emit("didFinishLaunching");
+    const warning = (log.warn as any).mock.calls
+      .map((c: any[]) => String(c[0]))
+      .find((m: string) => m.includes("below the"));
+    expect(warning).toBeDefined();
+    const setup = (log.info as any).mock.calls
+      .map((c: any[]) => String(c[0]))
+      .find((m: string) => m.includes("Re-broadcasting every"));
+    expect(setup).toContain("5 seconds");
+  });
+
+  it("leaves a sane discoveryInterval alone", () => {
+    const { api, log } = makePlatform({ discoveryInterval: 30 });
+    api.emit("didFinishLaunching");
+    const setup = (log.info as any).mock.calls
+      .map((c: any[]) => String(c[0]))
+      .find((m: string) => m.includes("Re-broadcasting every"));
+    expect(setup).toContain("30 seconds");
   });
 });
 
@@ -227,4 +257,27 @@ describe("HomebridgeWizLan.initRefreshInterval", () => {
       .find((m: string) => m.includes("Setting up ping"));
     expect(setupMsg).toBeDefined();
   });
+
+  it("spreads the sweep instead of probing every device in one tick", async () => {
+    // A synchronous burst of N probes is what a flood looks like on the wire,
+    // and the correlated loss it causes is what makes bulbs miss their
+    // deadline and flap to "No Response".
+    const { platform, api } = makePlatform({ refreshInterval: 1 });
+    const pinged: string[] = [];
+    for (const name of ["a", "b", "c", "d", "e"]) {
+      platform.initializedAccessories[name] = {
+        getPilot: () => {
+          pinged.push(name);
+          return Promise.resolve({} as any);
+        },
+      } as any;
+    }
+
+    await new Promise((r) => setTimeout(r, 1050));
+    // The tick fires the first device immediately and staggers the rest.
+    expect(pinged.length).toBe(1);
+    await new Promise((r) => setTimeout(r, 450));
+    expect(pinged.length).toBe(5);
+    api.emit("shutdown");
+  }, 10000);
 });

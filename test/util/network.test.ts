@@ -10,9 +10,11 @@ import {
   getPilot,
   hasInFlightGetPilot,
   registerDiscoveryHandler,
+  resetRateLimitsForTesting,
   sendDiscoveryBroadcast,
   setPilot,
 } from "../../src/util/network";
+import { recordFailure, recordSuccess } from "../../src/util/offline";
 import {
   cachedPilot,
   setPilot as setLightPilot,
@@ -123,7 +125,7 @@ describe("network: getPilot retransmits", () => {
   it("retransmits the request once while unanswered (2 packets inside the 1s window)", async () => {
     const wiz = makeFakeWiz(baseConfig());
     const device = uniqueDevice();
-    getPilot(wiz, device, () => {});
+    getPilot(wiz, device, () => {}, { retransmit: true });
     // The retransmit fires at 400ms; sample well past it but before the 1s
     // deadline.
     await new Promise((r) => setTimeout(r, 750));
@@ -134,11 +136,24 @@ describe("network: getPilot retransmits", () => {
     expect(sends.every((s) => s.ip === device.ip)).toBe(true);
   }, 5000);
 
+  it("does not retransmit unless the caller asks for it", async () => {
+    const wiz = makeFakeWiz(baseConfig());
+    const device = uniqueDevice();
+    // The default: HomeKit was already answered from cache, so a second copy
+    // would only add load without changing anything the user sees.
+    getPilot(wiz, device, () => {});
+    await new Promise((r) => setTimeout(r, 750));
+    expect(
+      (wiz.socket as FakeSocket).sent.filter((s) => s.msg.includes('"getPilot"'))
+        .length,
+    ).toBe(1);
+  }, 5000);
+
   it("stops retransmitting once a reply arrives", async () => {
     const wiz = makeFakeWiz(baseConfig());
     registerDiscoveryHandler(wiz, () => {});
     const device = uniqueDevice();
-    getPilot(wiz, device, () => {});
+    getPilot(wiz, device, () => {}, { retransmit: true });
     wiz.socket.emit(
       "message",
       Buffer.from(
@@ -157,31 +172,34 @@ describe("network: getPilot retransmits", () => {
   }, 5000);
 });
 
-describe("network: duplicate reply absorption", () => {
-  const reply = (wiz: any, device: any, extra: any = {}) =>
-    wiz.socket.emit(
-      "message",
-      Buffer.from(
-        JSON.stringify({
-          method: "getPilot",
-          result: { mac: device.mac, state: false, ...extra },
-        }),
-      ),
-      { address: device.ip, port: 38899 },
-    );
+// Synthesize a getPilot reply from a device, as the real dgram handler sees it.
+const reply = (wiz: any, device: any, extra: any = {}) =>
+  wiz.socket.emit(
+    "message",
+    Buffer.from(
+      JSON.stringify({
+        method: "getPilot",
+        result: { mac: device.mac, state: false, ...extra },
+      }),
+    ),
+    { address: device.ip, port: 38899 },
+  );
 
+describe("network: duplicate reply absorption", () => {
   it("absorbs the duplicate a retransmitted probe can elicit instead of resolving the next probe with it", async () => {
     const wiz = makeFakeWiz(baseConfig());
     registerDiscoveryHandler(wiz, () => {});
     const device = uniqueDevice();
     const first: any[] = [];
-    getPilot(wiz, device, (_e, p) => first.push(p));
+    getPilot(wiz, device, (_e, p) => first.push(p), { retransmit: true });
     // Let the 400ms retransmit fire so two copies of the probe are on the wire.
     await new Promise((r) => setTimeout(r, 500));
     reply(wiz, device, { state: false });
     expect(first.length).toBe(1);
     // A new probe opens; the bulb's answer to the retransmitted copy lands
-    // first, carrying state read before the previous probe closed.
+    // first, carrying state read before the previous probe closed. Isolating
+    // from the probe rate limiter here — its own behaviour is covered below.
+    resetRateLimitsForTesting();
     const second: any[] = [];
     getPilot(wiz, device, (_e, p) => second.push(p));
     reply(wiz, device, { state: false });
@@ -193,7 +211,7 @@ describe("network: duplicate reply absorption", () => {
     expect(second[0].state).toBe(true);
   }, 5000);
 
-  it("does not absorb anything when the probe resolved before retransmitting", () => {
+  it("does not absorb anything when the probe was not retransmitted", () => {
     const wiz = makeFakeWiz(baseConfig());
     registerDiscoveryHandler(wiz, () => {});
     const device = uniqueDevice();
@@ -202,6 +220,7 @@ describe("network: duplicate reply absorption", () => {
     // One packet out, one reply back — no duplicate is possible.
     reply(wiz, device);
     expect(first.length).toBe(1);
+    resetRateLimitsForTesting();
     const second: any[] = [];
     getPilot(wiz, device, (_e, p) => second.push(p));
     reply(wiz, device, { state: true });
@@ -213,16 +232,119 @@ describe("network: duplicate reply absorption", () => {
     const wiz = makeFakeWiz(baseConfig());
     registerDiscoveryHandler(wiz, () => {});
     const device = uniqueDevice();
-    getPilot(wiz, device, () => {});
+    getPilot(wiz, device, () => {}, { retransmit: true });
     await new Promise((r) => setTimeout(r, 500)); // retransmit fired
     reply(wiz, device);
-    // Wait out the 600ms window with no duplicate arriving.
+    // Wait out the window with no duplicate arriving.
     await new Promise((r) => setTimeout(r, 700));
     const second: any[] = [];
     getPilot(wiz, device, (_e, p) => second.push(p));
     reply(wiz, device, { state: true });
     expect(second.length).toBe(1);
   }, 5000);
+
+  it("never absorbs past the point a fresh probe could be answered", async () => {
+    const wiz = makeFakeWiz(baseConfig());
+    registerDiscoveryHandler(wiz, () => {});
+    const device = uniqueDevice();
+    getPilot(wiz, device, () => {}, { retransmit: true });
+    // Reply late in the probe's life, so a fixed 600ms window would still be
+    // open when the rate limiter permits the next probe at 1000ms — and would
+    // eat that probe's genuine reply.
+    await new Promise((r) => setTimeout(r, 900));
+    reply(wiz, device);
+    await new Promise((r) => setTimeout(r, 150));
+    const second: any[] = [];
+    getPilot(wiz, device, (_e, p) => second.push(p));
+    reply(wiz, device, { state: true });
+    expect(second.length).toBe(1);
+    expect(second[0].state).toBe(true);
+  }, 5000);
+});
+
+describe("network: getPilot rate limiting", () => {
+  it("caps transmitted probes at one per second per device however fast callers ask", async () => {
+    resetRateLimitsForTesting();
+    const wiz = makeFakeWiz(baseConfig());
+    registerDiscoveryHandler(wiz, () => {});
+    const device = uniqueDevice();
+    const sent = () =>
+      (wiz.socket as FakeSocket).sent.filter((s) => s.msg.includes('"getPilot"'))
+        .length;
+
+    // 50 read/reply cycles back to back — the pattern a controller produces
+    // once cache-first reads stop pacing it with a UDP round trip.
+    for (let i = 0; i < 50; i++) {
+      getPilot(wiz, device, () => {});
+      reply(wiz, device);
+    }
+    expect(sent()).toBe(1);
+
+    // Callers are deferred, not dropped: the probe still goes out, so state
+    // keeps converging — just at a rate the network can carry.
+    await new Promise((r) => setTimeout(r, 1100));
+    expect(sent()).toBe(2);
+  }, 10000);
+
+  it("coalesces every caller that arrives during the throttle window onto the deferred probe", async () => {
+    resetRateLimitsForTesting();
+    const wiz = makeFakeWiz(baseConfig());
+    registerDiscoveryHandler(wiz, () => {});
+    const device = uniqueDevice();
+    getPilot(wiz, device, () => {});
+    reply(wiz, device);
+
+    const answered: any[] = [];
+    for (let i = 0; i < 5; i++) {
+      getPilot(wiz, device, (_e, p) => answered.push(p));
+    }
+    // hasInFlightGetPilot covers deferred probes too, so the accessory layer
+    // still sees "a probe will answer you" and does not start another.
+    expect(hasInFlightGetPilot(device.mac)).toBe(true);
+    expect(answered.length).toBe(0);
+
+    await new Promise((r) => setTimeout(r, 1100));
+    reply(wiz, device, { state: true });
+    expect(answered.length).toBe(5);
+    expect(answered.every((p) => p.state === true)).toBe(true);
+  }, 10000);
+
+  it("backs off hard on a device that has been marked offline", async () => {
+    resetRateLimitsForTesting();
+    const wiz = makeFakeWiz(baseConfig());
+    registerDiscoveryHandler(wiz, () => {});
+    const device = uniqueDevice();
+    getPilot(wiz, device, () => {});
+    reply(wiz, device);
+    recordFailure(device.mac, 1); // now offline
+
+    // Past the normal 1s floor, but nowhere near the offline backoff.
+    await new Promise((r) => setTimeout(r, 1100));
+    getPilot(wiz, device, () => {});
+    expect(
+      (wiz.socket as FakeSocket).sent.filter((s) => s.msg.includes('"getPilot"'))
+        .length,
+    ).toBe(1);
+    recordSuccess(device.mac);
+  }, 10000);
+
+  it("honours a refreshInterval shorter than the offline backoff", async () => {
+    resetRateLimitsForTesting();
+    const wiz = makeFakeWiz({ ...baseConfig(), refreshInterval: 1 });
+    registerDiscoveryHandler(wiz, () => {});
+    const device = uniqueDevice();
+    getPilot(wiz, device, () => {});
+    reply(wiz, device);
+    recordFailure(device.mac, 1);
+
+    await new Promise((r) => setTimeout(r, 1100));
+    getPilot(wiz, device, () => {});
+    expect(
+      (wiz.socket as FakeSocket).sent.filter((s) => s.msg.includes('"getPilot"'))
+        .length,
+    ).toBe(2);
+    recordSuccess(device.mac);
+  }, 10000);
 });
 
 describe("network: malformed and error replies", () => {
@@ -567,6 +689,10 @@ describe("network: discovery message routing", () => {
 });
 
 describe("network: sendDiscoveryBroadcast", () => {
+  // The broadcast throttle is module-scoped wall-clock state, so one test's
+  // broadcast would otherwise silence the next one's.
+  beforeEach(() => resetRateLimitsForTesting());
+
   it("broadcasts a registration UDP to the configured broadcast IP", () => {
     const wiz = makeFakeWiz(baseConfig());
     sendDiscoveryBroadcast(wiz);
@@ -589,5 +715,13 @@ describe("network: sendDiscoveryBroadcast", () => {
     const targets = (wiz.socket as FakeSocket).sent.map((s) => s.ip).sort();
     expect(targets).toContain("10.0.0.77");
     expect(targets).toContain("10.0.0.78");
+  });
+
+  it("throttles back-to-back broadcasts — every host on the subnet sees these", () => {
+    const wiz = makeFakeWiz(baseConfig());
+    for (let i = 0; i < 20; i++) {
+      sendDiscoveryBroadcast(wiz);
+    }
+    expect((wiz.socket as FakeSocket).sent.length).toBe(1);
   });
 });

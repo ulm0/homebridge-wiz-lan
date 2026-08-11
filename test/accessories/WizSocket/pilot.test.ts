@@ -5,12 +5,24 @@ const pendingSet: ((e: Error | null) => void)[] = [];
 // Mirror the real layer's per-mac coalescing: the first unresolved call for a
 // mac transmits the probe and later calls piggyback on it. Firing the
 // transmitting call's callback closes the probe, like the real reply handler
-// deleting the queue entry before running the batch.
+// deleting the queue entry before running the batch. The transmitting call
+// also runs `onTransmit`, which is how the accessory layer snapshots state as
+// of the moment the packet goes on the wire.
 const openGetProbes = new Set<string>();
+const getPilotOptions: any[] = [];
 const getPilotMock = mock(
-  (_w: any, d: any, cb: (e: Error | null, p: any) => void) => {
+  (
+    _w: any,
+    d: any,
+    cb: (e: Error | null, p: any) => void,
+    options?: { retransmit?: boolean; onTransmit?: () => void },
+  ) => {
+    getPilotOptions.push(options);
     const startedProbe = !openGetProbes.has(d.mac);
-    if (startedProbe) openGetProbes.add(d.mac);
+    if (startedProbe) {
+      openGetProbes.add(d.mac);
+      options?.onTransmit?.();
+    }
     let fired = false;
     pendingGet.push((e, p) => {
       if (!fired) {
@@ -61,6 +73,7 @@ beforeEach(() => {
   pendingGet.length = 0;
   pendingSet.length = 0;
   openGetProbes.clear();
+  getPilotOptions.length = 0;
   getPilotMock.mockClear();
   setPilotMock.mockClear();
   // Reset offline state for any MAC a test might use
@@ -163,6 +176,67 @@ describe("WizSocket/pilot: cache-first responses", () => {
     const svc = accessory.getService(wiz.Service.Outlet)!;
     expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
       .toHaveBeenCalled();
+  });
+});
+
+// Same regression guard as the light: re-publishing an unchanged value still
+// emits a HAP event notification, and controllers answer notifications by
+// reading — each read being a UDP probe.
+describe("WizSocket/pilot: characteristic updates are change-driven", () => {
+  const poll = (wiz: any, accessory: any, device: any, pilot: any) => {
+    getPilot(wiz, accessory, device, () => {}, () => {});
+    pendingGet[pendingGet.length - 1](null, pilot);
+  };
+
+  it("does not re-publish On when the reply matches what HomeKit holds", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC });
+    cachedPilot[TEST_MAC] = makeSocketPilot({ mac: TEST_MAC, state: true });
+    const on = accessory
+      .getService(wiz.Service.Outlet)!
+      .getCharacteristic(wiz.Characteristic.On);
+
+    for (let i = 0; i < 5; i++) {
+      poll(wiz, accessory, device, makeSocketPilot({ mac: TEST_MAC, state: true }));
+    }
+    // Published once, on the first poll, then never again while state holds.
+    expect(on.updateValue).toHaveBeenCalledTimes(1);
+
+    poll(wiz, accessory, device, makeSocketPilot({ mac: TEST_MAC, state: false }));
+    expect(on.updateValue).toHaveBeenCalledTimes(2);
+  });
+
+  it("force-publishes when the device comes back from offline", () => {
+    const mac = `${TEST_MAC}_BACK`;
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac });
+    const on = accessory
+      .getService(wiz.Service.Outlet)!
+      .getCharacteristic(wiz.Characteristic.On);
+
+    cachedPilot[mac] = makeSocketPilot({ mac, state: true });
+    poll(wiz, accessory, device, makeSocketPilot({ mac, state: true }));
+    const before = (on.updateValue as any).mock.calls.length;
+    recordFailure(mac, 1);
+
+    poll(wiz, accessory, device, makeSocketPilot({ mac, state: true }));
+    expect((on.updateValue as any).mock.calls.length).toBeGreaterThan(before);
+    _recordSuccess(mac);
+  });
+
+  it("asks for a retransmit only when HomeKit is blocked on the reply", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC });
+
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    expect(getPilotOptions[0].retransmit).toBe(true);
+
+    pendingGet[0](null, makeSocketPilot({ mac: TEST_MAC }));
+    getPilot(wiz, accessory as any, device, () => {}, () => {});
+    expect(getPilotOptions[1].retransmit).toBe(false);
   });
 });
 
