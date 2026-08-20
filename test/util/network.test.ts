@@ -587,6 +587,73 @@ describe("network: setPilot ack timeout", () => {
     );
     expect(errB).toBeNull();
   }, 10000);
+
+  it("does not let failed-write reconciliation roll back a newer acknowledged write", async () => {
+    const wiz = makeFakeWiz(baseConfig());
+    const device = uniqueDevice({ ip: "10.7.7.11" });
+    const accessory = makeAccessoryWithService("Lightbulb");
+    registerDiscoveryHandler(wiz, () => {});
+
+    const socket = wiz.socket as FakeSocket;
+    const realSend = socket.send;
+    let setPilotCount = 0;
+    let bWasSent = false;
+    (socket as any).send = (
+      msg: string | Buffer,
+      port: number,
+      ip: string,
+      callback?: (error: Error | null) => void,
+    ) => {
+      const payload = JSON.parse(msg.toString());
+      realSend(msg, port, ip, callback);
+
+      if (payload.method === "setPilot") {
+        setPilotCount += 1;
+        if (setPilotCount === 2) {
+          bWasSent = true;
+          setTimeout(() => {
+            socket.emit(
+              "message",
+              Buffer.from(JSON.stringify({ method: "setPilot", result: {} })),
+              { address: device.ip, port: 38899 },
+            );
+          }, 10);
+        }
+      } else if (payload.method === "getPilot") {
+        const dimmingAtProbe = bWasSent ? 80 : 10;
+        setTimeout(() => {
+          socket.emit(
+            "message",
+            Buffer.from(JSON.stringify({
+              method: "getPilot",
+              result: {
+                mac: device.mac,
+                state: true,
+                dimming: dimmingAtProbe,
+                rssi: -50,
+                src: "udp",
+              },
+            })),
+            { address: device.ip, port: 38899 },
+          );
+        }, 50);
+      }
+    };
+
+    cachedPilot[device.mac] = makeLightPilot({
+      mac: device.mac,
+      state: false,
+      dimming: 20,
+    });
+    setLightPilot(wiz, accessory as any, device, { state: true }, () => {});
+    setLightPilot(wiz, accessory as any, device, { dimming: 80 }, () => {});
+
+    await new Promise((resolve) => setTimeout(resolve, 2250));
+
+    expect(setPilotCount).toBe(2);
+    expect(cachedPilot[device.mac].state).toBe(true);
+    expect(cachedPilot[device.mac].dimming).toBe(80);
+  }, 5000);
 });
 
 describe("network: discovery message routing", () => {

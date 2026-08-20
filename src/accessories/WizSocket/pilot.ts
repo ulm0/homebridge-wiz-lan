@@ -25,12 +25,21 @@ export interface Pilot extends WizPilot {
 // to default values
 export const cachedPilot: { [mac: string]: Pilot } = {};
 
-// Bumped on every transmitted setPilot. A getPilot probe captures the value
-// when it starts; if a write advanced it before the reply returns, the device
-// generated that reply before the write reached it. Committing such a reply
-// would roll cachedPilot — and the HomeKit tile — back to pre-write state
-// (cache-first reads leave probes in flight long enough for a user write to
-// interleave, and its ack can beat the delayed reply).
+// Bumped twice per setPilot: once when the write is optimistically committed
+// to cachedPilot, and again when it resolves (ack, send error, or timeout). A
+// getPilot probe captures the value when it is transmitted; if it differs when
+// the reply lands, the device generated that reply before the write reached it
+// — or while the write was still unresolved, so it may have. Committing such a
+// reply would roll cachedPilot — and the HomeKit tile — back to pre-write
+// state (cache-first reads leave probes in flight long enough for a user write
+// to interleave, and its ack can beat the delayed reply).
+//
+// The resolution bump is what covers a write that is committed but not yet on
+// the wire: between the two bumps the cache is ahead of the device, so a probe
+// transmitted in that window reads pre-write state while its snapshot already
+// matches the commit bump. Nothing would mark that reply stale — see the
+// failed-write reconciliation in setPilot, which probes while the write queued
+// behind it is still waiting its turn on the wire.
 export const writeGeneration: { [mac: string]: number } = {};
 
 // writeGeneration snapshot taken when the underlying UDP probe was actually
@@ -195,6 +204,12 @@ export function setPilot(
   writeGeneration[device.mac] = (writeGeneration[device.mac] ?? 0) + 1;
   cachedPilot[device.mac] = optimisticPilot;
   return _setPilot(wiz, device, newPilot, (error) => {
+    // Resolution bump — see writeGeneration. Must happen before the
+    // reconciliation probe below so that probe's snapshot includes this
+    // write's resolution and its reply is not discarded on our account; a
+    // write still queued behind us bumps again when it resolves, which is
+    // exactly what invalidates a probe transmitted before it was sent.
+    writeGeneration[device.mac] = (writeGeneration[device.mac] ?? 0) + 1;
     // Roll back only while this write still owns the cache entry. A newer
     // queued write (or a fresh getPilot) may have replaced it by the time
     // this write times out — the queued command is still transmitted after
