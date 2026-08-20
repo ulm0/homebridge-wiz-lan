@@ -450,6 +450,31 @@ describe("WizSocket/pilot: failed-write resync", () => {
       .toHaveBeenCalled();
   });
 
+  it("does not let the resync probe roll back a write that was still queued behind the failure", () => {
+    const wiz = makeFakeWiz();
+    const accessory = makeOutletAccessory();
+    const device = makeDevice({ mac: TEST_MAC, model: "ESP10_SOCKET_06" });
+    cachedPilot[TEST_MAC] = makeSocketPilot({ mac: TEST_MAC, state: false });
+    // A goes on the wire; B is committed to the cache but parks behind A in
+    // the network layer's queue, so nothing of B has reached the device yet.
+    setPilot(wiz, accessory as any, device, { state: true }, () => {});
+    setPilot(wiz, accessory as any, device, { state: false }, () => {});
+    expect(cachedPilot[TEST_MAC].state).toBe(false);
+
+    // A's ack times out. Its resync probe is transmitted while B is still
+    // unsent, so the device answers it with post-A/pre-B state.
+    pendingSet[0](new Error("ack timeout"));
+    expect(pendingGet.length).toBe(1);
+    // B is then flushed and acked — the cache's state:false is now confirmed.
+    pendingSet[1](null);
+    // The probe reply predates B and must not resurrect A's state.
+    pendingGet[0](null, makeSocketPilot({ mac: TEST_MAC, state: true }));
+    expect(cachedPilot[TEST_MAC].state).toBe(false);
+    const svc = accessory.getService(wiz.Service.Outlet)!;
+    expect(svc.getCharacteristic(wiz.Characteristic.On).updateValue)
+      .not.toHaveBeenCalled();
+  });
+
   it("does not probe after a successful write", () => {
     const wiz = makeFakeWiz();
     const accessory = makeOutletAccessory();
