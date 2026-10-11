@@ -6,6 +6,7 @@ import {
 } from "./characteristics";
 import { initScenes } from "./characteristics/scenes";
 import { getPilot, Pilot } from "./pilot";
+import { initSpaceSense } from "./spaceSense";
 import { isRGB, isTW } from "./util";
 
 class WizLight extends WizAccessory<Pilot> {
@@ -79,6 +80,7 @@ class WizLight extends WizAccessory<Pilot> {
     }
 
     initScenes(wiz, accessory, device);
+    initSpaceSense(wiz, accessory, device);
   };
   getPilot = () => {
     return new Promise<Pilot>((resolve, reject) => {

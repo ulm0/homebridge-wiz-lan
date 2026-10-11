@@ -11,6 +11,7 @@ import Accessories, { WizAccessory } from './accessories';
 import { PLATFORM_NAME, PLUGIN_NAME } from "./constants";
 import { Config, Device } from "./types";
 import { bindSocket, createSocket, MIN_DISCOVERY_INTERVAL_SECONDS, registerDiscoveryHandler, sendDiscoveryBroadcast } from "./util/network";
+import { isSpaceSenseEnabled, renewPushAfterDiscovery, startPushUpdates } from "./util/push";
 
 // The refresh sweep used to emit one probe per device in a single synchronous
 // tick. A burst like that is what a flood looks like on the wire, and the
@@ -50,6 +51,10 @@ export default class HomebridgeWizLan {
       bindSocket(this, () => {
         registerDiscoveryHandler(this, this.tryAddDevice.bind(this));
         sendDiscoveryBroadcast(this);
+        if (isSpaceSenseEnabled(this)) {
+          startPushUpdates(this);
+          renewPushAfterDiscovery();
+        }
         this.initDiscoveryInterval();
       });
     });
@@ -124,6 +129,7 @@ export default class HomebridgeWizLan {
       const timer = setInterval(() => {
         this.log.debug("[Discovery] Sending periodic discovery broadcast...");
         sendDiscoveryBroadcast(this);
+        renewPushAfterDiscovery();
       }, effective * 1000);
       this.api.on("shutdown", () => clearInterval(timer));
     }

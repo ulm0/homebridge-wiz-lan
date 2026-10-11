@@ -1,7 +1,18 @@
 import { PlatformConfig } from "homebridge";
 
+export interface SpaceSenseConfig {
+  enabled?: boolean;
+  sensorType?: "occupancy" | "motion";
+  /** Seconds after which a detection clears on its own; 0 = never. */
+  timeout?: number;
+  occupancySources?: string[];
+  vacancySources?: string[];
+}
+
 export interface Config extends PlatformConfig {
   port?: number;
+  mac?: string;
+  spaceSense?: SpaceSenseConfig;
   enableScenes?: boolean;
   lastStatus?: boolean;
   broadcast?: string;

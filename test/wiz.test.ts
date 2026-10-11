@@ -22,6 +22,7 @@ mock.module("dgram", () => ({
 }));
 
 import HomebridgeWizLan from "../src/wiz";
+import { resetPushForTesting } from "../src/util/push";
 
 const makePlatform = (config: any = {}) => {
   const api = makeFakeAPI();
@@ -46,6 +47,28 @@ describe("HomebridgeWizLan.constructor", () => {
     // sendDiscoveryBroadcast emits a registration message
     const reg = sharedSocket.sent.find((s) => s.msg.includes("registration"));
     expect(reg).toBeDefined();
+  });
+
+  it("subscribes cached bulbs to push updates when spaceSense is enabled", () => {
+    resetPushForTesting();
+    const { platform, api } = makePlatform({ spaceSense: { enabled: true } });
+    const accessory = new api.platformAccessory("Lamp", "uuid-a8bb5006033d");
+    accessory.context = makeDevice({ mac: "a8bb5006033d", ip: "10.0.0.60" });
+    accessory.addService(api.hap.Service.Lightbulb, "Lamp");
+    platform.configureAccessory(accessory);
+    api.emit("didFinishLaunching");
+    const subscribe = sharedSocket.sent.find(
+      (s) => s.msg.includes('"register":true') && s.ip === "10.0.0.60",
+    );
+    expect(subscribe).toBeDefined();
+    api.emit("shutdown");
+  });
+
+  it("does not subscribe to push updates by default", () => {
+    resetPushForTesting();
+    const { api } = makePlatform();
+    api.emit("didFinishLaunching");
+    expect(sharedSocket.sent.some((s) => s.msg.includes('"register":true'))).toBe(false);
   });
 
 });

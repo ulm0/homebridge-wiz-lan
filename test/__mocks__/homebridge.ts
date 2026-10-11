@@ -68,12 +68,18 @@ export const FakeServiceCtors = {
   Television: makeServiceCtor("Television"),
   AccessoryInformation: makeServiceCtor("AccessoryInformation"),
   InputSource: makeServiceCtor("InputSource"),
+  OccupancySensor: makeServiceCtor("OccupancySensor"),
+  MotionSensor: makeServiceCtor("MotionSensor"),
 } as const;
 
 const charKey = (name: string) => name;
 export const FakeCharacteristicCtors: Record<string, string> & {
   IsConfigured: { CONFIGURED: number };
   InputSourceType: { HDMI: number };
+  OccupancyDetected: {
+    OCCUPANCY_DETECTED: number;
+    OCCUPANCY_NOT_DETECTED: number;
+  };
 } = Object.assign(
   {
     On: charKey("On"),
@@ -90,10 +96,15 @@ export const FakeCharacteristicCtors: Record<string, string> & {
     Manufacturer: charKey("Manufacturer"),
     Model: charKey("Model"),
     SerialNumber: charKey("SerialNumber"),
+    MotionDetected: charKey("MotionDetected"),
   },
   {
     IsConfigured: { CONFIGURED: 1 } as any,
     InputSourceType: { HDMI: 3 } as any,
+    OccupancyDetected: {
+      OCCUPANCY_DETECTED: 1,
+      OCCUPANCY_NOT_DETECTED: 0,
+    } as any,
   },
 ) as any;
 

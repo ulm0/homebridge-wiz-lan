@@ -17,9 +17,9 @@ function strIp() {
   return internalIpV4Sync() ?? "0.0.0.0";
 }
 
-const BROADCAST_PORT = 38899;
+export const BROADCAST_PORT = 38899;
 
-function getNetworkConfig({ config }: HomebridgeWizLan) {
+export function getNetworkConfig({ config }: HomebridgeWizLan) {
   return {
     ADDRESS: config.address ?? strIp(),
     PORT: config.port ?? 38900,

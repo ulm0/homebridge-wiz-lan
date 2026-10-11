@@ -62,6 +62,46 @@
         "minimum": 1,
         "description": "[Optional] Number of consecutive missed pings before a device is marked as 'No Response' in Apple Home. Requires Refresh Interval > 0."
       },
+      "spaceSense": {
+        "title": "SpaceSense (experimental)",
+        "type": "object",
+        "description": "Expose WiZ SpaceSense (Wi-Fi motion sensing done by the bulbs) as a HomeKit sensor on each bulb. SpaceSense must be set up in the WiZ app with a lighting action (On/Off works best): the plugin sees the light changes SpaceSense makes, not raw motion. Pushes are always delivered to UDP 38900.",
+        "properties": {
+          "enabled": {
+            "title": "Enable SpaceSense sensor",
+            "type": "boolean",
+            "default": false
+          },
+          "sensorType": {
+            "title": "Sensor type",
+            "type": "string",
+            "default": "occupancy",
+            "oneOf": [
+              { "title": "Occupancy sensor", "enum": ["occupancy"] },
+              { "title": "Motion sensor", "enum": ["motion"] }
+            ]
+          },
+          "timeout": {
+            "title": "Auto-clear after (seconds)",
+            "type": "integer",
+            "default": 0,
+            "minimum": 0,
+            "description": "Clear a detection after this many seconds even if no vacancy push arrives. 0 = only clear on a vacancy push."
+          },
+          "occupancySources": {
+            "title": "Occupancy sources (advanced)",
+            "type": "array",
+            "description": "Push `src` values that report detection (light on) and vacancy (light off). Default: wfsens, pir.",
+            "items": { "type": "string" }
+          },
+          "vacancySources": {
+            "title": "Vacancy sources (advanced)",
+            "type": "array",
+            "description": "Additional push `src` values that report vacancy when they turn the light off. Default: intl.",
+            "items": { "type": "string" }
+          }
+        }
+      },
       "devices": {
         "title": "Devices",
         "type": "array",

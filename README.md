@@ -84,6 +84,24 @@ Full configuration options:
     // the device only recovers when HomeKit actively queries it.
     // Default: 3
     "pingFailuresBeforeOffline": 3,
+
+    // [Optional, experimental] Expose WiZ SpaceSense as a sensor on each bulb.
+    // See "SpaceSense" below.
+    "spaceSense": {
+      // Default: false
+      "enabled": true,
+      // "occupancy" or "motion". Default: "occupancy"
+      "sensorType": "occupancy",
+      // Clear a detection after this many seconds even without a vacancy
+      // push. 0 = only clear on a vacancy push. Default: 0
+      "timeout": 0,
+      // [Advanced] Push `src` values that report detection when they turn the
+      // light on, and vacancy when they turn it off. Default: ["wfsens", "pir"]
+      "occupancySources": ["wfsens", "pir"],
+      // [Advanced] Extra `src` values that report vacancy when they turn the
+      // light off. Default: ["intl"]
+      "vacancySources": ["intl"],
+    },
   }
 ```
 
@@ -102,6 +120,16 @@ If a "rhythm" is selected in the Wiz app and `lastStatus` is set to `true`, the 
 
 ### Offline detection (config setting)
 By default, when a bulb stops responding to UDP requests the plugin replays its last known state — so a bulb that's been unplugged or dropped off the network still appears fully operational in HomeKit. With `refreshInterval > 0`, after `pingFailuresBeforeOffline` consecutive missed responses the accessory is surfaced to HomeKit as "Not Responding", and a successful reply clears the state immediately. Pair with `discoveryInterval > 0` so bulbs that return to the network (or get a new DHCP lease) are re-learned automatically.
+
+### SpaceSense (experimental)
+SpaceSense lets WiZ bulbs detect motion from disturbances in the Wi-Fi signal between them. WiZ offers no local API for it, so the plugin reads its *effect*: with `spaceSense.enabled`, the plugin subscribes to each bulb's push updates (`registration` with `register: true`, renewed every 15 seconds), and when a SpaceSense automation changes a light, that bulb pushes a `syncPilot` whose `src` names the trigger. Each bulb gets an occupancy (or motion) sensor that turns on when SpaceSense turns the light on and off when it turns it off.
+
+To use it:
+- Set up SpaceSense for the room in the WiZ app (it needs at least two compatible lights) and pick a lighting action. **On/Off** is the most reliable. With "No Action" the bulbs change nothing, so there is nothing to observe. With a brightness change the light stays on, so vacancy can't be told apart from detection.
+- Keep `port` at 38900, or make sure nothing else on the Homebridge host uses UDP 38900. Bulbs always deliver pushes there, and the plugin opens a second listener if `port` is set to something else. Home Assistant's WiZ integration also binds that port, so the two can't run on the same host.
+- Make sure the bulbs can reach `address` (auto-detected by default) on UDP 38900.
+
+What the plugin knows about the push `src` values comes from a handful of community reports. `wfsens` on detection is the best established; `intl` on vacancy is from a single report. The plugin logs every new `src` value it sees, so if the sensor doesn't behave, run Homebridge in debug mode (`-D`) while walking in and out of the room. Then adjust `occupancySources`/`vacancySources` or open an issue with the `syncPilot` lines from the log. The `pir` source covers WiZ's PIR motion-sensor accessory, which works the same way.
 
 ### Adaptive Lighting
 Automatically enabled for RGB and Tunable White bulbs. If you (or another app) change the bulb's color or temperature outside of Adaptive Lighting's schedule, it deactivates itself so you stay in control. HomeKit can re-enable it from the bulb's settings.
